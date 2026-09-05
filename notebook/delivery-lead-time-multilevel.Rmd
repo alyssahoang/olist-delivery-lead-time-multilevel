@@ -1,0 +1,4665 @@
+---
+title: "A Multilevel and Robust Investigation of Delivery Lead Time in E‑Commerce"
+author: "Tram Anh Hoang"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: false
+    df_print: paged
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+    code_download: true
+  pdf_document: default
+always_allow_html: true
+fontsize: 11pt
+---
+
+# 1. Introduction and questions
+
+Delivery performance is a central dimension of service quality in e‑commerce, and delays or high variability in delivery lead time can directly affect customer satisfaction and platform reputation. On large marketplaces such as Olist, substantial heterogeneity in delivery times may arise from differences in seller operations, geographic distance between sellers and customers, and order‑level characteristics such as shipment weight or payment conditions.
+
+This project uses the Olist Brazilian e‑commerce dataset to study delivery lead time at the level of individual orders. The primary outcome is delivery lead time, defined as the time between order purchase and the customer delivery date, with additional information from customers, order items, sellers, and payments to characterize geographic and operational drivers. Building on the Advanced Multivariate Statistics syllabus, we adopt a multilevel modelling framework with random intercepts for sellers and customer states, complemented by robust procedures and bootstrap inference.
+
+The analysis addresses three research questions:
+
+- RQ1: How much of the variability in delivery lead time is attributable to seller‑level and geographic‑level heterogeneity?
+
+- RQ2: Which order and shipment characteristics are significantly associated with faster or slower delivery times?
+
+- RQ3: Are the estimated effects robust to extreme observations and sampling variability?
+
+We answer these questions through a sequence of steps: exploratory analysis of raw delivery patterns, construction of a clean order‑level dataset, estimation of baseline and multilevel models, and assessment of robustness using trimming and bootstrap confidence intervals.
+
+# 2. Data and variables
+
+We loaded six Olist tables (orders, order_items, products, customers, sellers, geolocation) plus the category mapping table used for theme engineering. Variable names were standardized to lower case with underscores to simplify manipulation. Basic summaries showed that timestamps in the orders table cover purchases from 2016‑09‑04 to 2018‑10‑17 and estimated deliveries up to 2018‑11‑12.
+
+### 2.1 Load Data
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(tidyverse)
+library(janitor)
+library(readr)
+library(lme4)
+library(lmerTest)
+library(boot)
+library(broom)
+library(broom.mixed)
+library(lme4)
+library(insight)      # variance extraction style like in class
+library(performance)  # ICC, R2, model checks
+library(boot)         # for boot.ci style CIs (optional)
+library(robustlmm)    # robust mixed models (rq3)
+library(RColorBrewer)
+library(gridExtra)
+library(forcats)
+library(corrplot)
+library(robustbase)
+
+# Minimal visual system with clearer color defaults for HTML readability
+brand_blue <- "#2563eb"
+brand_teal <- "#0f766e"
+brand_orange <- "#d97706"
+brand_rose <- "#be123c"
+hist_fill <- "#93c5fd"
+hist_border <- "white"
+
+options(
+  ggplot2.discrete.colour = c(brand_blue, brand_teal, brand_orange, brand_rose, "#7c3aed", "#15803d"),
+  ggplot2.discrete.fill = c("#bfdbfe", "#99f6e4", "#fdba74", "#fda4af", "#c4b5fd", "#86efac"),
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis"
+)
+
+update_geom_defaults("boxplot", list(fill = "#dbeafe", colour = "#334155"))
+update_geom_defaults("histogram", list(fill = hist_fill, colour = hist_border))
+update_geom_defaults("line", list(colour = brand_blue))
+update_geom_defaults("point", list(colour = brand_blue))
+update_geom_defaults("smooth", list(colour = brand_teal, fill = "#ccfbf1"))
+
+theme_set(
+  theme_minimal(base_size = 10.5) +
+    theme(
+      plot.title = element_text(face = "bold", colour = "#0f172a"),
+      plot.subtitle = element_text(colour = "#334155"),
+      axis.title = element_text(colour = "#1f2937"),
+      axis.text = element_text(colour = "#334155"),
+      legend.position = "top"
+    )
+)
+set.seed(42)
+
+```
+
+Orders: olist_orders_dataset with order id, customer id, status, purchase and delivery timestamps, estimated delivery.
+
+```{r}
+data_dir <- normalizePath("../data", winslash = "/", mustWork = TRUE)
+
+files <- c(
+  orders      = "olist_orders_dataset.csv",
+  order_items = "olist_order_items_dataset.csv",
+  products    = "olist_products_dataset.csv",
+  customers   = "olist_customers_dataset.csv",
+  sellers     = "olist_sellers_dataset.csv",
+  geolocation = "olist_geolocation_dataset.csv",
+  cat_matrix = "product_category_matrix.csv"
+)
+
+dfs <- purrr::imap(files, ~ readr::read_csv(file.path(data_dir, .x), show_col_types = FALSE) |>
+                     janitor::clean_names())
+
+orders      <- dfs$orders
+order_items <- dfs$order_items
+products    <- dfs$products
+customers   <- dfs$customers
+sellers     <- dfs$sellers
+geolocation <- dfs$geolocation
+cat_matrix  <- dfs$cat_matrix
+```
+
+```{r}
+## Quick dimensions
+purrr::imap(dfs, ~ tibble(table = .y, n = nrow(.x), p = ncol(.x))) |> bind_rows()
+
+## Variable names
+summaries <- purrr::map(dfs, summary)
+summaries
+```
+
+### 2.2 Diagnostics
+
+In the **orders** table, 2,965 orders (about 3%) lack a customer delivery timestamp, and 1783 lack a carrier delivery date, while purchase and estimated delivery timestamps are almost always present. Order status is mostly “delivered” (about 96k orders), with smaller groups in “shipped”, “invoiced”, and “canceled”.
+
+```{r}
+#Missingness report (only cols with missing)
+miss <- purrr::imap_dfr(dfs, function(df, nm) {
+  df |>
+    summarise(across(everything(), ~ sum(is.na(.x)))) |>
+    pivot_longer(everything(), names_to = "col", values_to = "n_missing") |>
+    mutate(pct_missing = n_missing / nrow(df), table = nm) |>
+    filter(n_missing > 0)
+}) |>
+  arrange(desc(pct_missing), desc(n_missing))
+
+miss
+```
+```{r}
+check_unique <- function(df, cols) {
+  df |> count(across(all_of(cols))) |> filter(n > 1)
+}
+
+list(
+  sellers_dup_keys     = check_unique(dfs$sellers, "seller_id"),
+  customers_dup_keys   = check_unique(dfs$customers, "customer_id"),
+  orders_dup_keys      = check_unique(dfs$orders, "order_id"),
+  products_dup_keys    = check_unique(dfs$products, "product_id"),
+  order_items_dup_keys = check_unique(dfs$order_items, c("order_id", "order_item_id"))
+)
+
+```
+```{r}
+order_items %>%
+  distinct(order_id, seller_id) %>%
+  count(order_id, name = "n_sellers") %>%
+  count(n_sellers, name = "n_orders") %>%
+  arrange(n_sellers)
+order_items %>%
+  distinct(order_id, seller_id) %>%
+  count(order_id, name = "n_sellers") %>%
+  summarise(
+    n_orders = n(),
+    n_multi  = sum(n_sellers > 1),
+    pct_multi = 100 * mean(n_sellers > 1),
+    max_sellers = max(n_sellers)
+  )
+```
+
+Joining order_items indicates that 98,666 orders appear in the order_items table, and that 97,388 of these (98.7%) involve exactly one seller, while only 1,278 orders (1.3%) involve multiple sellers, with a maximum of five sellers in a single order. This pattern supports focusing the main analysis on single‑seller orders so that each observation can be unambiguously associated with a single seller when specifying random intercepts.
+​
+
+```{r}
+#FK integrity 
+list(
+  orders_missing_customers =
+    anti_join(dfs$orders, dfs$customers, by = "customer_id"),
+  items_missing_orders =
+    anti_join(dfs$order_items, dfs$orders, by = "order_id"),
+  items_missing_products =
+    anti_join(dfs$order_items, dfs$products, by = "product_id"),
+  items_missing_sellers =
+    anti_join(dfs$order_items, dfs$sellers, by = "seller_id")
+) |>
+  purrr::imap(~ nrow(.x))
+```
+
+
+```{r}
+#Orders without items
+orders_without_items <- anti_join(dfs$orders, dfs$order_items |> distinct(order_id), by = "order_id")
+orders_without_items |> count(order_status, sort = TRUE)
+```
+
+
+Next we construct a very simple raw delivery lead time (without any filtering) and inspect its distribution and obvious data issues. 
+
+```{r}
+# Delivery Lead Time and Tails
+
+orders_tmp <- orders %>%
+  mutate(
+ 
+    purchase_ts  = as.POSIXct(order_purchase_timestamp, tz = "UTC"),
+    delivered_ts = as.POSIXct(order_delivered_customer_date, tz = "UTC"),
+    estimated_ts = as.POSIXct(order_estimated_delivery_date, tz = "UTC"),
+  # outcome + lateness vs estimate
+    lead_time_days_raw = as.numeric(difftime(delivered_ts, purchase_ts, units = "days")),
+    delay_vs_estimated_days = as.numeric(difftime(delivered_ts, estimated_ts, units = "days"))
+
+)
+orders_tmp %>%
+  summarize(
+    orders_n = n(),
+    delivered_n = sum(order_status == "delivered", na.rm = TRUE),
+    purchase_start = min(purchase_ts, na.rm = TRUE),
+    purchase_end = max(purchase_ts, na.rm = TRUE),
+    n_estimated_missing = sum(is.na(estimated_ts)),
+    n_delay_missing = sum(is.na(delay_vs_estimated_days)),
+    delay_min = min(delay_vs_estimated_days, na.rm = TRUE),
+    delay_med = median(delay_vs_estimated_days, na.rm = TRUE),
+    delay_max = max(delay_vs_estimated_days, na.rm = TRUE)
+)
+
+table(orders_tmp$order_status)
+
+
+
+#Check completeness of required timestamps
+orders_tmp %>%
+  filter(order_status == "delivered") %>%
+  summarize(
+    missing_purchase_ts = sum(is.na(purchase_ts)),
+    missing_delivered_ts = sum(is.na(delivered_ts)),
+    missing_estimated_ts = sum(is.na(estimated_ts))
+  )
+
+
+# Canceled but delivered timestamp present
+orders_tmp |> filter(order_status == "canceled", !is.na(order_delivered_customer_date)) |> select(order_id, order_status, order_delivered_customer_date)
+orders_tmp$purchase_ts  <- ymd_hms(orders_tmp$order_purchase_timestamp)
+orders_tmp$delivered_ts <- ymd_hms(orders_tmp$order_delivered_customer_date)
+
+orders_tmp$lead_time_days_raw <- as.numeric(
+  difftime(orders_tmp$delivered_ts,
+           orders_tmp$purchase_ts,
+           units = "days")
+)
+
+summary(orders_tmp$lead_time_days_raw)
+
+# tail threshold
+lead_tail <- orders_tmp %>%
+  summarize(
+    lead_p50 = quantile(lead_time_days_raw, 0.50, na.rm = TRUE),
+    lead_p90 = quantile(lead_time_days_raw, 0.90, na.rm = TRUE),
+    lead_p95 = quantile(lead_time_days_raw, 0.95, na.rm = TRUE),
+    lead_p99 = quantile(lead_time_days_raw, 0.99, na.rm = TRUE),
+    lead_max = max(lead_time_days_raw, na.rm = TRUE)
+  )
+
+lead_tail
+
+trim_cut_99 <- quantile(orders_tmp$lead_time_days_raw, 0.99, na.rm = TRUE)
+trim_cut_98 <- quantile(orders_tmp$lead_time_days_raw, 0.98, na.rm = TRUE)
+trim_cut_99
+trim_cut_98
+
+
+table(
+  negative = orders_tmp$lead_time_days_raw < 0,
+  missing  = is.na(orders_tmp$lead_time_days_raw)
+)
+
+
+```
+
+
+
+Overall most orders delivered within about 5–20 days, median lead time is around 10.2 days, the mean 12.6 days, with the 95th percentile at roughly 29 days. No negative durations were observed, but about 3% of orders have missing lead times. These quantiles indicate a strongly right-skewed distribution with a long upper tail and suggest using the 98th–99th percentiles (roughly 39–46 days) as natural thresholds for defining “extreme” lead times in subsequent robustness checks.
+
+To explore potential hierarchical structure, we merge orders with customers and sellers and summarize raw lead times by customer_state and seller_state. Customer‑state summaries show substantial differences in typical delivery times: for example, the mean lead time in São Paulo (SP) is below 9 days, while several northern states such as Amazonas (AM) and Pará (PA) have means above 23–26 days and much higher upper quantiles. Seller‑state summaries also display marked variation, though with fewer observations per group, suggesting that both customer geography and seller location contribute to heterogeneity in delivery performance.
+
+```{r}
+# Patterns in customer and seller state delivery
+orders_raw <- orders_tmp %>%
+  mutate(
+    lead_time_days_raw = as.numeric(difftime(delivered_ts, purchase_ts, units = "days"))
+  )
+
+# Attach customer_state to orders (raw, no filtering)
+orders_cust_raw <- orders_raw %>%
+  left_join(customers %>% select(customer_id, customer_state),
+            by = "customer_id")
+
+#For sellers: collapse items to one seller per order (rough look)
+# (also keep n_sellers so you can see how many orders are multi-seller)
+order_seller_raw <- order_items %>%
+  distinct(order_id, seller_id) %>%
+  group_by(order_id) %>%
+  summarise(
+    seller_id = first(seller_id),
+    n_sellers = n_distinct(seller_id),
+    .groups = "drop"
+  )
+
+orders_cs_raw <- orders_cust_raw %>%
+  left_join(order_seller_raw, by = "order_id") %>%
+  left_join(sellers %>% select(seller_id, seller_state),
+            by = "seller_id")
+
+#Simple summaries by state (like tapply(summary))
+cust_state_summ <- orders_cs_raw %>%
+  group_by(customer_state) %>%
+  summarise(
+    n     = sum(!is.na(lead_time_days_raw)),
+    mean  = mean(lead_time_days_raw, na.rm = TRUE),
+    sd    = sd(lead_time_days_raw, na.rm = TRUE),
+    min   = min(lead_time_days_raw, na.rm = TRUE),
+    q25   = quantile(lead_time_days_raw, .25, na.rm = TRUE),
+    med   = median(lead_time_days_raw, na.rm = TRUE),
+    q75   = quantile(lead_time_days_raw, .75, na.rm = TRUE),
+    p90   = quantile(lead_time_days_raw, .90, na.rm = TRUE),
+    p95   = quantile(lead_time_days_raw, .95, na.rm = TRUE),
+    max   = max(lead_time_days_raw, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n))
+
+seller_state_summ <- orders_cs_raw %>%
+  group_by(seller_state) %>%
+  summarise(
+    n     = sum(!is.na(lead_time_days_raw)),
+    mean  = mean(lead_time_days_raw, na.rm = TRUE),
+    sd    = sd(lead_time_days_raw, na.rm = TRUE),
+    min   = min(lead_time_days_raw, na.rm = TRUE),
+    q25   = quantile(lead_time_days_raw, .25, na.rm = TRUE),
+    med   = median(lead_time_days_raw, na.rm = TRUE),
+    q75   = quantile(lead_time_days_raw, .75, na.rm = TRUE),
+    p90   = quantile(lead_time_days_raw, .90, na.rm = TRUE),
+    p95   = quantile(lead_time_days_raw, .95, na.rm = TRUE),
+    max   = max(lead_time_days_raw, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n))
+
+cust_state_summ
+seller_state_summ
+
+```
+
+
+Grouped summaries show strong heterogeneity in delivery times across customer states: for instance, the mean raw lead time in SP is about 8.8 days, whereas several northern states (e.g., AM, PA) show means above 23–26 days and much higher upper quantiles. Similar variation appears across seller states, although with fewer groups and smaller sample sizes. These patterns indicate that both geography and seller behavior contribute to variability in lead time and motivate the use of mixed‑effects models with random intercepts for customer state and seller identity.
+
+Because delivery times are highly right‑skewed with a long tail, and we aim to interpret effects in relative terms, we model the logarithm of delivery lead time (equivalently, log1p(lead_time_days)) as the response in the mixed‑effects models, so that model assumptions are better satisfied and fixed effects can be read as approximate percentage differences in expected delivery time.
+Detailed state-level lead-time boxplots and routing contrasts are presented once in Section 4.1 to avoid repeated visuals across sections.
+These initial diagnostics highlight three key features: a skewed and heavy‑tailed distribution of delivery lead time, a small fraction of missing or unusable timestamps, and clear heterogeneity across customer and seller states. In the next section we formalize the cleaning rules and analysis plan, define a log‑transformed lead‑time outcome, and construct a clean order‑level dataset incorporating customer and seller information for multilevel modeling.
+
+## 2.3 Cleaning
+
+In this step, we focus on constructing a coherent base sample for modelling delivery lead time. We first restrict the orders table to completed deliveries with non-missing purchase and customer delivery timestamps and nonnegative raw lead times, so that the outcome is well defined and not driven by obvious data errors or incomplete processes. Given that almost all orders in the order_items table involve a single seller, we further retain only orders linked to exactly one seller in order to obtain a clear seller-level grouping structure for the subsequent mixed-effects models; this removes only about 1.3% of orders while ensuring that each observation can be uniquely associated with a single seller random intercept. We then attach minimal geographic information by joining customer_state and seller_state and construct an `is_same_state` indicator, together with simple calendar controls (purchase year, weekday, and broad season), which will later allow us to examine basic temporal patterns and distinguish within-state from cross-state shipments without overcomplicating the feature space at this stage.
+
+```{r}
+# 1) Base delivered sample with valid lead time
+orders_base <- orders_tmp %>%
+  filter(order_status == "delivered") %>%
+  filter(!is.na(purchase_ts), !is.na(delivered_ts)) %>%
+  filter(!is.na(lead_time_days_raw), lead_time_days_raw >= 0)
+
+# 2) Restrict to orders linked to exactly 1 seller
+seller_per_order <- order_items %>%
+  distinct(order_id, seller_id) %>%
+  count(order_id, name = "n_sellers") %>%
+  left_join(
+    order_items %>%
+      group_by(order_id) %>%
+      summarise(seller_id = first(seller_id), .groups = "drop"),
+    by = "order_id"
+  )
+
+# collapse to one seller per order and keep n_sellers
+order_seller_raw <- order_items %>%
+  distinct(order_id, seller_id) %>%
+  group_by(order_id) %>%
+  summarise(
+    seller_id = first(seller_id),
+    n_sellers = n_distinct(seller_id),
+    .groups = "drop"
+  )
+
+# attach customer and seller info
+orders_cs_raw <- orders_base %>%
+  left_join(customers %>% select(customer_id, customer_state), by = "customer_id") %>%
+  left_join(order_seller_raw, by = "order_id") %>%
+  left_join(sellers %>% select(seller_id, seller_state), by = "seller_id")
+
+orders_1seller <- orders_base %>%
+  left_join(seller_per_order, by = "order_id") %>%
+  filter(n_sellers == 1)
+
+# 3) Minimal geography attaches (states only)
+orders_clean_core <- orders_1seller %>%
+  left_join(customers %>% select(customer_id, customer_state), by = "customer_id") %>%
+  left_join(sellers   %>% select(seller_id, seller_state),     by = "seller_id") %>%
+  mutate(
+    is_same_state = (customer_state == seller_state),
+    purchase_year  = factor(year(purchase_ts)),
+    purchase_wday  = factor(wday(purchase_ts, label = TRUE, abbr = TRUE)),
+    season = factor(
+      case_when(
+        month(purchase_ts) %in% c(12, 1, 2) ~ "DJF",
+        month(purchase_ts) %in% c(3, 4, 5)  ~ "MAM",
+        month(purchase_ts) %in% c(6, 7, 8)  ~ "JJA",
+        month(purchase_ts) %in% c(9, 10, 11) ~ "SON",
+        TRUE ~ NA_character_
+      ),
+      levels = c("DJF", "MAM", "JJA", "SON")
+    )
+  )
+
+tibble(
+  step = c("Delivered + valid timestamps + lead_time>=0", "Restricted to 1 seller/order"),
+  n_orders = c(nrow(orders_base), nrow(orders_clean_core))
+)
+```
+```{r}
+dim(orders_clean_core)
+summary(orders_clean_core)
+```
+
+
+# 3. Data Construction
+In this section we construct order‑level predictors for delivery lead time and put them on scales suitable for mixed‑effects modelling. We log‑transform the highly skewed outcome and shipment variables (weight, volume, value, freight, items), standardize continuous predictors, and collapse very rare product categories into an ‘other’ level, while carefully checking ranges, missingness, and collinearity. Missing or zero shipment dimensions are handled via simple median‑by‑category imputation with missingness indicators, and a complete‑case variant of the data confirms that these choices have negligible impact on the analysis.
+
+## 3.1 Variables Transformation
+
+### 3.1.1 Predictors Transformation
+For predictors, we assigned each order a main product category by aggregating product categories at the order level, weighting items by their value (price + freight). Among 74 categories, 22 have fewer than 100 orders and together account for only about 0.85% of orders, so we collapsed these rare levels and unknowns into a single ‘other’ category to avoid unstable estimates from very small groups. The cleaned factor main_cat_pt_collapsed thus retains interpretable top categories while collecting very low‑volume or missing labels into a single residual level.
+
+#### Enrich with category
+
+```{r}
+#Order-level distribution
+# 1) main category per order (PT), weighted by item value
+products_pt <- products %>%
+  mutate(product_category_name = fct_explicit_na(product_category_name, na_level = "unknown"))
+
+orders_main_cat_pt <- order_items %>%
+  semi_join(orders_clean_core %>% select(order_id), by = "order_id") %>%
+  left_join(products_pt %>% select(product_id, product_category_name), by = "product_id") %>%
+  mutate(
+    product_category_name = fct_explicit_na(product_category_name, "unknown"),
+    item_value = price + freight_value
+  ) %>%
+  group_by(order_id, product_category_name) %>%
+  summarise(cat_value = sum(item_value, na.rm = TRUE), .groups = "drop") %>%
+  group_by(order_id) %>%
+  arrange(desc(cat_value), .by_group = TRUE) %>%
+  summarise(main_cat_pt = first(product_category_name), .groups = "drop")
+
+orders_cat_pt_counts <- orders_main_cat_pt %>%
+  count(main_cat_pt, name = "n_orders") %>%
+  arrange(desc(n_orders))
+
+```
+
+```{r}
+orders_cat_pt_counts %>%
+  summarise(
+    n_levels = n(),
+    pct_levels_lt_50  = mean(n_orders < 50) * 100,
+    pct_levels_lt_100 = mean(n_orders < 100) * 100,
+    tail_share_lt_100 = sum(n_orders[n_orders < 100]) / sum(n_orders) * 100
+  )
+```
+```{r}
+# 2) counts per category (order-level)
+cat_counts <- orders_main_cat_pt %>%
+  count(main_cat_pt, name = "n_orders") %>%
+  mutate(
+    share = n_orders / sum(n_orders),
+    share_pct = 100 * share
+  ) %>%
+  arrange(n_orders)
+
+low_freq_cats <- cat_counts %>%
+  filter(n_orders < 100, main_cat_pt != "unknown") %>%
+  arrange(n_orders)
+
+
+low_freq_cats
+
+low_freq_cats %>%
+  summarise(
+    n_low_levels = n(),
+    total_orders_in_low_levels = sum(n_orders),
+    pct_orders_in_low_levels = 100 * sum(n_orders) / sum(cat_counts$n_orders)
+  )
+
+```
+
+22 categories have <100 orders and together represent 0.85% of orders, so we will collapse them to “other".
+
+```{r}
+# identify sparse levels to collapse
+sparse_levels <- low_freq_cats %>% pull(main_cat_pt)
+orders_model <- orders_clean_core %>%
+  left_join(orders_main_cat_pt, by = "order_id") %>%
+  mutate(
+    main_cat_pt = fct_explicit_na(main_cat_pt, "unknown"),
+    main_cat_pt_collapsed = fct_collapse(main_cat_pt, other = sparse_levels),
+    main_cat_pt_collapsed = fct_collapse(main_cat_pt_collapsed, other = "unknown")
+  )
+# check result
+orders_model %>% count(main_cat_pt_collapsed, sort = TRUE)
+
+```
+
+Product themes
+Collapsing detailed categories into binary indicators for product behavior:
+
+- `is_hedonic`: hedonic vs utilitarian
+- `is_experience`: experience vs search
+
+We construct four product-theme quadrants by crossing the classic search vs experience dimension (Nelson, 1970, 1974) with the utilitarian vs hedonic distinction in shopping value and consumption (Hirschman & Holbrook, 1982; Babin et al., 1994), then map Olist categories into these quadrants.
+
+Search vs experience goods:
+- Search goods: customers can evaluate quality before purchase (specifications, reviews, images), for example many electronics or tools.
+- Experience goods: quality is clearer after use, for example fashion, cosmetics, or hobby products.
+
+Utilitarian vs hedonic goods:
+- Utilitarian goods: functional and problem-solving products with practical benefits, for example office supplies or appliances.
+- Hedonic goods: products linked to pleasure, enjoyment, or self-expression, for example gifts, games, and decorative items.
+
+Crossing these dimensions yields four quadrants:
+- Search + Utilitarian: for example tools, office goods, and basic electronics.
+- Search + Hedonic: for example high-spec leisure electronics and some hobby categories.
+- Experience + Utilitarian: for example function-oriented apparel, health/beauty essentials, and practical personal-care products.
+- Experience + Hedonic: for example decor, gifts, and fashion-accessory categories.
+
+Why this aggregation is used in this project:
+- It stabilizes estimation by reducing dozens of sparse Olist categories into a small number of interpretable groups.
+- It captures differences in how delivery timing may matter by product context. For search-utilitarian goods, customers may mainly value reliable, predictable delivery; for experience-hedonic or gift-like goods, late delivery can more strongly reduce satisfaction because timing is part of the experience.
+
+This is a conceptual control for broad product mix, not a causal treatment variable.
+
+```{r}
+category_matrix <- readr::read_csv(
+  file.path(data_dir, "product_category_matrix.csv"),
+  show_col_types = FALSE
+) %>%
+  janitor::clean_names() %>%
+  transmute(
+    product_category_name = as.character(product_category_name),
+    category_english = as.character(category_english),
+    is_hedonic = as.integer(is_hedonic),
+    is_experience = as.integer(is_experience)
+  )
+
+theme_quadrant_lookup <- category_matrix %>%
+  mutate(
+    theme_name = dplyr::case_when(
+      is_experience == 0 & is_hedonic == 0 ~ "Search + Utilitarian",
+      is_experience == 0 & is_hedonic == 1 ~ "Search + Hedonic",
+      is_experience == 1 & is_hedonic == 0 ~ "Experience + Utilitarian",
+      is_experience == 1 & is_hedonic == 1 ~ "Experience + Hedonic",
+      TRUE ~ "Unknown"
+    ),
+    rationale = dplyr::case_when(
+      theme_name == "Search + Utilitarian" ~ "Durable and spec-driven items; delivery reliability and utility are salient.",
+      theme_name == "Search + Hedonic" ~ "Spec-comparable but discretionary goods; convenience and timing can shape purchase experience.",
+      theme_name == "Experience + Utilitarian" ~ "Use-value goods with quality learned in use; delivery speed supports practical planning.",
+      theme_name == "Experience + Hedonic" ~ "Affective and experiential goods; delivery timeliness affects perceived excitement and satisfaction.",
+      TRUE ~ "Fallback mapping for categories outside the four quadrants."
+    )
+  ) %>%
+  transmute(
+    olist_category = product_category_name,
+    english_label = category_english,
+    theme = theme_name,
+    rationale
+  ) %>%
+  arrange(theme, olist_category)
+```
+
+```{r}
+theme_quadrant_lookup
+```
+
+```{r}
+category_matrix_model <- category_matrix %>%
+  dplyr::select(product_category_name, is_hedonic, is_experience)
+```
+
+```{r}
+
+order_theme_raw <- orders_main_cat_pt %>%
+  mutate(main_cat_pt_chr = as.character(main_cat_pt)) %>%
+  left_join(category_matrix_model, by = c("main_cat_pt_chr" = "product_category_name"))
+
+order_theme <- order_theme_raw %>%
+  transmute(
+    order_id,
+    theme_matched = !is.na(is_hedonic) & !is.na(is_experience),
+    is_hedonic = if_else(theme_matched, as.integer(is_hedonic), NA_integer_),
+    is_experience = if_else(theme_matched, as.integer(is_experience), NA_integer_)
+  )
+
+orders_model <- orders_model %>%
+  select(-any_of(c("theme_matched", "is_hedonic", "is_experience", "theme_name"))) %>%
+  left_join(order_theme, by = "order_id") %>%
+  mutate(
+    # After theme matching, unmatched categories are collapsed into "other"
+    main_cat_pt_collapsed = if_else(
+      !coalesce(theme_matched, FALSE),
+      "other",
+      as.character(main_cat_pt_collapsed)
+    ),
+    main_cat_pt_collapsed = factor(main_cat_pt_collapsed),
+    # Keep binary flags numeric for modeling; unmatched set to 0 after collapse
+    is_hedonic = as.integer(coalesce(is_hedonic, 0L)),
+    is_experience = as.integer(coalesce(is_experience, 0L)),
+    theme_name = case_when(
+      !coalesce(theme_matched, FALSE) ~ "Other (unmapped)",
+      is_experience == 0 & is_hedonic == 0 ~ "Search + Utilitarian",
+      is_experience == 0 & is_hedonic == 1 ~ "Search + Hedonic",
+      is_experience == 1 & is_hedonic == 0 ~ "Experience + Utilitarian",
+      is_experience == 1 & is_hedonic == 1 ~ "Experience + Hedonic",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  select(-theme_matched)
+
+orders_model %>%
+  summarise(
+    pct_hedonic = mean(is_hedonic == 1, na.rm = TRUE) * 100,
+    pct_experience = mean(is_experience == 1, na.rm = TRUE) * 100
+  )
+
+orders_model %>%
+  count(theme_name, name = "n_orders") %>%
+  mutate(pct_orders = 100 * n_orders / sum(n_orders)) %>%
+  arrange(desc(n_orders))
+
+# Sanity check: categories with no theme mapping in category_matrix
+order_theme_raw %>%
+  filter(is.na(is_hedonic) | is.na(is_experience)) %>%
+  count(main_cat_pt_chr, name = "n_orders") %>%
+  arrange(desc(n_orders))
+```
+
+
+
+#### Enrich with region
+Using `POP2017_20220905.xls`, we build state-level population (2017) from municipal totals and map each UF to a macro-region (North, Northeast, Central-West, Southeast, South). We then attach customer/seller region and population to each order. We follow the standard IBGE macro-region grouping of Brazilian states.
+
+```{r}
+pop_mun_raw <- readxl::read_excel(
+  file.path(data_dir, "POP2017_20220905.xls"),
+  sheet = "Municípios",
+  col_names = FALSE
+)
+
+pop_mun <- pop_mun_raw %>%
+  slice(-(1:2)) %>%
+  transmute(
+    uf = stringr::str_to_upper(stringr::str_trim(as.character(...1))),
+    pop_2017_mun = readr::parse_number(
+      as.character(...5),
+      locale = readr::locale(grouping_mark = ".", decimal_mark = ",")
+    )
+  ) %>%
+  filter(!is.na(uf), !is.na(pop_2017_mun))
+
+pop_state_2017 <- pop_mun %>%
+  group_by(uf) %>%
+  summarise(
+    pop_2017_state = sum(pop_2017_mun, na.rm = TRUE),
+    n_municipios = n(),
+    .groups = "drop"
+  )
+
+uf_region <- tibble::tribble(
+  ~uf, ~region,
+  "AC", "North", "AL", "Northeast", "AP", "North", "AM", "North", "BA", "Northeast",
+  "CE", "Northeast", "DF", "Central-West", "ES", "Southeast", "GO", "Central-West",
+  "MA", "Northeast", "MT", "Central-West", "MS", "Central-West", "MG", "Southeast",
+  "PA", "North", "PB", "Northeast", "PR", "South", "PE", "Northeast", "PI", "Northeast",
+  "RJ", "Southeast", "RN", "Northeast", "RS", "South", "RO", "North", "RR", "North",
+  "SC", "South", "SP", "Southeast", "SE", "Northeast", "TO", "North"
+)
+
+ibge_region_mapping <- uf_region %>%
+  mutate(region = factor(region, levels = c("North", "Northeast", "Central-West", "Southeast", "South"))) %>%
+  arrange(region, uf) %>%
+  group_by(region) %>%
+  summarise(
+    n_states = n(),
+    states = paste(uf, collapse = ", "),
+    .groups = "drop"
+  )
+
+ibge_region_mapping
+
+state_region_pop <- uf_region %>%
+  left_join(pop_state_2017, by = "uf")
+
+orders_model <- orders_model %>%
+  select(-any_of(c(
+    "customer_region", "seller_region",
+    "customer_state_pop_2017", "seller_state_pop_2017",
+    "is_same_region"
+  ))) %>%
+  left_join(
+    state_region_pop %>%
+      transmute(
+        customer_state = uf,
+        customer_region = region,
+        customer_state_pop_2017 = pop_2017_state
+      ),
+    by = "customer_state"
+  ) %>%
+  left_join(
+    state_region_pop %>%
+      transmute(
+        seller_state = uf,
+        seller_region = region,
+        seller_state_pop_2017 = pop_2017_state
+      ),
+    by = "seller_state"
+  ) %>%
+  mutate(
+    is_same_region = customer_region == seller_region
+  )
+
+orders_model %>%
+  summarise(
+    pct_na_customer_region = mean(is.na(customer_region)) * 100,
+    pct_na_seller_region = mean(is.na(seller_region)) * 100,
+    pct_same_region = mean(is_same_region, na.rm = TRUE) * 100
+  )
+```
+
+```{r}
+# Region distribution: customer vs seller
+region_dist <- bind_rows(
+  orders_model %>%
+    count(region = customer_region, name = "n_orders") %>%
+    mutate(side = "Customer"),
+  orders_model %>%
+    count(region = seller_region, name = "n_orders") %>%
+    mutate(side = "Seller")
+) %>%
+  filter(!is.na(region)) %>%
+  group_by(side) %>%
+  mutate(
+    pct_orders = 100 * n_orders / sum(n_orders),
+    region = factor(region, levels = c("North", "Northeast", "Central-West", "Southeast", "South"))
+  ) %>%
+  ungroup()
+
+region_dist %>%
+  arrange(side, desc(n_orders))
+```
+
+```{r}
+ggplot(region_dist, aes(x = region, y = pct_orders, fill = side)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", pct_orders)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.25,
+    size = 3.1
+  ) +
+  scale_fill_manual(values = c("Customer" = "#3b6fb6", "Seller" = "#d77a2d")) +
+  labs(
+    title = "Regional distribution of customers and sellers",
+    x = NULL,
+    y = "Share of orders (%)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+```
+
+
+
+```{r}
+# Population skewness
+pop_hist <- orders_model %>%
+  transmute(
+    customer_state_pop_2017,
+    seller_state_pop_2017,
+    log_customer_pop = log1p(customer_state_pop_2017),
+    log_seller_pop = log1p(seller_state_pop_2017),
+    z_log_customer_pop = as.numeric(scale(log_customer_pop)),
+    z_log_seller_pop = as.numeric(scale(log_seller_pop))
+  ) %>%
+  pivot_longer(everything(), names_to = "measure", values_to = "value") %>%
+  mutate(
+    variable = case_when(
+      measure %in% c("customer_state_pop_2017", "log_customer_pop", "z_log_customer_pop") ~ "Customer state pop",
+      measure %in% c("seller_state_pop_2017", "log_seller_pop", "z_log_seller_pop") ~ "Seller state pop",
+      TRUE ~ "Other"
+    ),
+    stage = case_when(
+      measure %in% c("customer_state_pop_2017", "seller_state_pop_2017") ~ "Raw",
+      str_detect(measure, "^log_") ~ "log1p",
+      str_detect(measure, "^z_") ~ "z-score(log1p)"
+    ),
+    stage = factor(stage, levels = c("Raw", "log1p", "z-score(log1p)")),
+    panel = paste(variable, stage, sep = " — "),
+    panel = factor(panel, levels = c(
+      "Customer state pop — Raw", "Customer state pop — log1p", "Customer state pop — z-score(log1p)",
+      "Seller state pop — Raw", "Seller state pop — log1p", "Seller state pop — z-score(log1p)"
+    ))
+  ) %>%
+  filter(is.finite(value))
+```
+
+
+```{r}
+ggplot(pop_hist, aes(x = value)) +
+  geom_histogram(bins = 30, color = hist_border, fill = hist_fill) +
+  facet_wrap(~ panel, scales = "free", ncol = 2) +
+  theme_minimal() +
+  labs(
+    title = "State population distributions: raw vs log1p vs z-score(log1p)",
+    x = NULL, y = "Frequency"
+  )
+```
+
+```{r}
+# Population density map + mean lead-time map by customer state
+if (!exists("project_root_local") || is.null(project_root_local)) {
+  project_root_local <- tryCatch(
+    normalizePath(dirname(knitr::current_input(dir = TRUE)), winslash = "/", mustWork = FALSE),
+    error = function(e) normalizePath(".", winslash = "/", mustWork = FALSE)
+  )
+}
+if (!exists("tables_dir") || is.null(tables_dir)) {
+  tables_dir <- file.path(project_root_local, "output", "tables")
+  dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+}
+if (!exists("charts_dir") || is.null(charts_dir)) {
+  charts_dir <- file.path(project_root_local, "output", "charts")
+  dir.create(charts_dir, recursive = TRUE, showWarnings = FALSE)
+}
+
+state_area_km2 <- tibble::tribble(
+  ~uf, ~area_km2,
+  "AC", 164123.04, "AL", 27767.66, "AP", 142470.76, "AM", 1559167.89,
+  "BA", 564760.43, "CE", 148894.44, "DF", 5760.78, "ES", 46095.58,
+  "GO", 340111.38, "MA", 331937.45, "MT", 903206.99, "MS", 357145.53,
+  "MG", 586521.12, "PA", 1245870.70, "PB", 56467.24, "PR", 199307.93,
+  "PE", 98067.88, "PI", 251756.52, "RJ", 43780.17, "RN", 52796.79,
+  "RS", 281730.22, "RO", 237590.86, "RR", 223644.53, "SC", 95730.92,
+  "SP", 248219.63, "SE", 21910.35, "TO", 277620.91
+)
+
+geo_zip_lookup <- geolocation %>%
+  transmute(
+    zip_prefix = as.integer(geolocation_zip_code_prefix),
+    customer_state = stringr::str_to_upper(stringr::str_trim(as.character(geolocation_state))),
+    lon = as.numeric(geolocation_lng),
+    lat = as.numeric(geolocation_lat)
+  ) %>%
+  filter(!is.na(zip_prefix), !is.na(customer_state), is.finite(lon), is.finite(lat)) %>%
+  group_by(zip_prefix, customer_state) %>%
+  summarise(
+    lon = median(lon, na.rm = TRUE),
+    lat = median(lat, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+customers_geo <- customers %>%
+  transmute(
+    customer_id,
+    zip_prefix = as.integer(customer_zip_code_prefix),
+    customer_state = stringr::str_to_upper(stringr::str_trim(as.character(customer_state))),
+    customer_city = stringr::str_squish(as.character(customer_city))
+  ) %>%
+  left_join(geo_zip_lookup, by = c("zip_prefix", "customer_state"))
+
+state_region_lookup <- state_region_pop %>%
+  transmute(
+    customer_state = uf,
+    macro_region = region
+  )
+
+orders_geo_maps <- orders_clean_core %>%
+  select(order_id, customer_id, lead_time_days_raw) %>%
+  filter(!is.na(lead_time_days_raw), lead_time_days_raw >= 0, lead_time_days_raw <= 180) %>%
+  left_join(customers_geo, by = "customer_id") %>%
+  left_join(state_region_lookup, by = "customer_state") %>%
+  filter(is.finite(lon), is.finite(lat), !is.na(macro_region))
+
+city_metrics_maps <- orders_geo_maps %>%
+  mutate(city_key = paste0(stringr::str_to_lower(customer_city), "|", customer_state)) %>%
+  group_by(city_key, customer_city, customer_state, macro_region) %>%
+  summarise(
+    n_orders = n(),
+    mean_actual_delivery_days = mean(lead_time_days_raw, na.rm = TRUE),
+    lon = median(lon, na.rm = TRUE),
+    lat = median(lat, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(lon), is.finite(lat), !is.na(customer_city), customer_city != "")
+
+region_labels <- city_metrics_maps %>%
+  group_by(macro_region) %>%
+  summarise(
+    lon = weighted.mean(lon, w = pmax(n_orders, 1), na.rm = TRUE),
+    lat = weighted.mean(lat, w = pmax(n_orders, 1), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+region_border <- city_metrics_maps %>%
+  group_by(macro_region) %>%
+  group_modify(
+    ~ {
+      if (nrow(.x) < 3) return(.x[0, c("lon", "lat")])
+      hull_idx <- chull(.x$lon, .x$lat)
+      hull <- .x[hull_idx, c("lon", "lat")]
+      dplyr::bind_rows(hull, hull[1, c("lon", "lat")])
+    }
+  ) %>%
+  ungroup()
+
+top_city_labels <- city_metrics_maps %>%
+  group_by(macro_region) %>%
+  slice_max(order_by = n_orders, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(city_label = stringr::str_to_title(customer_city))
+
+has_maps <- requireNamespace("maps", quietly = TRUE)
+brazil_map_df <- if (has_maps) ggplot2::map_data("world", region = "Brazil") else NULL
+
+map_theme_density <- theme_minimal(base_size = 10.5) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right",
+    legend.direction = "vertical",
+    legend.box = "vertical",
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text = element_text(size = 8.4),
+    plot.title = element_text(face = "bold", size = 11.5),
+    plot.subtitle = element_text(size = 9)
+  )
+
+map_heat_guide <- guide_colorbar(
+  title.position = "top",
+  title.hjust = 0.5,
+  direction = "vertical",
+  barwidth = grid::unit(8, "pt"),
+  barheight = grid::unit(72, "pt"),
+  ticks.colour = NA
+)
+
+p_order_density <- ggplot() +
+  {if (has_maps) geom_polygon(
+    data = brazil_map_df, aes(x = long, y = lat, group = group),
+    fill = "grey95", color = "grey80", linewidth = 0.2
+  )} +
+  stat_bin_2d(
+    data = orders_geo_maps,
+    aes(x = lon, y = lat),
+    bins = c(56, 56),
+    alpha = 0.92
+  ) +
+  geom_path(
+    data = region_border, aes(x = lon, y = lat, group = macro_region),
+    inherit.aes = FALSE, color = "#4d4d4d", linewidth = 0.3, linetype = "22", alpha = 0.8
+  ) +
+  geom_text(
+    data = region_labels, aes(x = lon, y = lat, label = macro_region),
+    inherit.aes = FALSE, color = "#2B2B2B", fontface = "bold", size = 3.1, check_overlap = TRUE
+  ) +
+  geom_text(
+    data = top_city_labels, aes(x = lon, y = lat, label = city_label),
+    inherit.aes = FALSE, nudge_y = 0.4, color = "#1f1f1f", size = 2.4, check_overlap = TRUE
+  ) +
+  coord_quickmap(xlim = c(-75, -34), ylim = c(-34, 6), expand = FALSE) +
+  scale_fill_gradientn(
+    colors = c("#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"),
+    trans = "log1p",
+    labels = scales::label_number(accuracy = 1, scale_cut = scales::cut_short_scale()),
+    name = "Customer\norders",
+    na.value = "transparent",
+    guide = map_heat_guide
+  ) +
+  map_theme_density +
+  labs(
+    title = "Customer Order Density Heatmap",
+    subtitle = NULL
+  )
+
+p_mean_lead <- ggplot() +
+  {if (has_maps) geom_polygon(
+    data = brazil_map_df, aes(x = long, y = lat, group = group),
+    fill = "grey95", color = "grey80", linewidth = 0.2
+  )} +
+  stat_summary_2d(
+    data = orders_geo_maps,
+    aes(x = lon, y = lat, z = lead_time_days_raw),
+    fun = mean,
+    bins = c(56, 56),
+    alpha = 0.92
+  ) +
+  geom_path(
+    data = region_border, aes(x = lon, y = lat, group = macro_region),
+    inherit.aes = FALSE, color = "#4d4d4d", linewidth = 0.3, linetype = "22", alpha = 0.8
+  ) +
+  geom_text(
+    data = region_labels, aes(x = lon, y = lat, label = macro_region),
+    inherit.aes = FALSE, color = "#2B2B2B", fontface = "bold", size = 3.1, check_overlap = TRUE
+  ) +
+  geom_text(
+    data = top_city_labels, aes(x = lon, y = lat, label = city_label),
+    inherit.aes = FALSE, nudge_y = 0.4, color = "#1f1f1f", size = 2.4, check_overlap = TRUE
+  ) +
+  coord_quickmap(xlim = c(-75, -34), ylim = c(-34, 6), expand = FALSE) +
+  scale_fill_gradientn(
+    colors = c("#fff7ec", "#fee8c8", "#fdbb84", "#fc8d59", "#e34a33", "#b30000"),
+    labels = scales::label_number(accuracy = 0.1),
+    name = "Mean actual\ndelivery (days)",
+    na.value = "transparent",
+    guide = map_heat_guide
+  ) +
+  map_theme_density +
+  labs(
+    title = "Mean Delivery Lead Time Heatmap",
+    subtitle = NULL
+  )
+
+readr::write_csv(
+  city_metrics_maps %>%
+    select(city_key, customer_city, customer_state, macro_region, lon, lat, n_orders, mean_actual_delivery_days),
+  file.path(tables_dir, "city_order_delivery_metrics.csv")
+)
+
+plot_maps_combined <- gridExtra::arrangeGrob(
+  p_order_density, p_mean_lead, ncol = 2,
+  top = grid::textGrob(
+    "Brazil: Customer Order Density and Mean Actual Delivery Time",
+    gp = grid::gpar(fontsize = 11, fontface = "bold")
+  )
+)
+
+ggplot2::ggsave(
+  filename = file.path(charts_dir, "chart_order_delivery_density_maps.png"),
+  plot = plot_maps_combined, width = 16, height = 7.8, dpi = 320, bg = "white"
+)
+
+grid::grid.newpage()
+grid::grid.draw(plot_maps_combined)
+```
+
+```{r}
+orders_model <- orders_model %>%
+  mutate(
+    log_customer_pop = log1p(customer_state_pop_2017),
+    log_seller_pop = log1p(seller_state_pop_2017),
+    z_log_customer_pop = as.numeric(scale(log_customer_pop)),
+    z_log_seller_pop = as.numeric(scale(log_seller_pop))
+  )
+```
+
+
+#### Enrich with product dimension
+We constructed shipment‑level weight and volume by summing product weights and item volumes over items in each order. Histograms of weight and volume before and after log1p and z‑scaling show very heavy right tails on the raw scale and much more regular, roughly bell‑shaped distributions after transformation. We therefore use log1p‑transformed and z‑scored weight and volume as predictors, which reduces leverage from extremely bulky shipments and places them on a common scale.
+
+```{r}
+#Shipment dimensions
+
+items_dim <- order_items %>%
+  semi_join(orders_clean_core %>% select(order_id), by = "order_id") %>%
+  left_join(
+    products %>%
+      select(product_id, product_weight_g, product_length_cm, product_height_cm, product_width_cm),
+    by = "product_id"
+  ) %>%
+  mutate(item_volume_cm3 = product_length_cm * product_height_cm * product_width_cm)
+
+order_dim_raw <- items_dim %>%
+  group_by(order_id) %>%
+  summarise(
+    total_weight_g   = sum(product_weight_g, na.rm = TRUE),
+    total_volume_cm3 = sum(item_volume_cm3,  na.rm = TRUE),
+    .groups = "drop"
+    
+  )
+
+orders_model <- orders_model %>%
+  left_join(order_dim_raw, by = "order_id")
+
+```
+
+```{r}
+# Check skewness
+dim_hist <- orders_model %>%
+  transmute(
+    total_weight_g,
+    total_volume_cm3,
+
+    log_wgt = log1p(total_weight_g),
+    log_vol = log1p(total_volume_cm3),
+
+    z_log_wgt = as.numeric(scale(log_wgt)),
+    z_log_vol = as.numeric(scale(log_vol))
+  ) %>%
+  pivot_longer(everything(), names_to = "measure", values_to = "value") %>%
+  mutate(
+    variable = if_else(str_detect(measure, "wgt|weight"), "Weight", "Volume"),
+    stage = case_when(
+      measure %in% c("total_weight_g", "total_volume_cm3") ~ "Raw",
+      str_detect(measure, "^log_") ~ "log1p",
+      str_detect(measure, "^z_")   ~ "z-score(log1p)"
+    ),
+    stage = factor(stage, levels = c("Raw", "log1p", "z-score(log1p)")),
+    panel = paste(variable, stage, sep = " — "),
+    panel = factor(panel, levels = c(
+      "Volume — Raw", "Volume — log1p", "Volume — z-score(log1p)",
+      "Weight — Raw", "Weight — log1p", "Weight — z-score(log1p)"
+    ))
+  ) %>%
+  filter(is.finite(value))
+
+ggplot(dim_hist, aes(x = value)) +
+  geom_histogram(bins = 40, color = hist_border, fill = hist_fill) +
+  facet_wrap(~ panel, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Shipment dimension distributions: raw vs log1p vs z-score(log1p)",
+    x = NULL, y = "Frequency"
+  )
+```
+
+
+```{r}
+orders_model <- orders_model %>%
+  mutate(
+    log_wgt = log1p(total_weight_g),
+    log_vol = log1p(total_volume_cm3),
+    z_log_wgt = as.numeric(scale(log_wgt)),
+    z_log_vol = as.numeric(scale(log_vol))
+  )
+```
+
+#### Enrich with product value
+
+At the order level we derived total value (price + freight), total freight, and number of items, and again inspected their distributions under raw, log1p, and z‑scaled versions. All three variables are strongly right‑skewed in raw form but become much more symmetric and comparable in spread after log1p and standardization. In the models, we therefore use log1p‑transformed, z‑scored versions of items, value, and freight so that coefficients can be interpreted per one‑standard‑deviation increase and numerical optimization remains stable.
+
+```{r}
+
+#Order value / freight / items
+
+order_money_raw <- order_items %>%
+  semi_join(orders_clean_core %>% select(order_id), by = "order_id") %>%
+  group_by(order_id) %>%
+  summarise(
+    n_items = n(),
+    total_price   = sum(price, na.rm = TRUE),
+    total_freight = sum(freight_value, na.rm = TRUE),
+    total_value   = sum(price + freight_value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+orders_model <- orders_model %>%
+  left_join(order_money_raw, by = "order_id")
+```
+
+
+```{r}
+#Skewness check
+money_hist <- orders_model %>%
+  transmute(
+    n_items,
+    total_value,
+    total_freight,
+
+    log_items   = log1p(n_items),
+    log_value   = log1p(total_value),
+    log_freight = log1p(total_freight),
+
+    z_log_items   = as.numeric(scale(log_items)),
+    z_log_value   = as.numeric(scale(log_value)),
+    z_log_freight = as.numeric(scale(log_freight))
+  ) %>%
+  pivot_longer(everything(), names_to = "measure", values_to = "value") %>%
+  mutate(
+    variable = case_when(
+      str_detect(measure, "items")   ~ "Items",
+      str_detect(measure, "value")   ~ "Value",
+      str_detect(measure, "freight") ~ "Freight"
+    ),
+    stage = case_when(
+      measure %in% c("n_items", "total_value", "total_freight") ~ "Raw",
+      str_detect(measure, "^log_") ~ "log1p",
+      str_detect(measure, "^z_")   ~ "z-score(log1p)"
+    ),
+    stage = factor(stage, levels = c("Raw", "log1p", "z-score(log1p)")),
+    panel = paste(variable, stage, sep = " — "),
+    panel = factor(panel, levels = c(
+      "Items — Raw", "Items — log1p", "Items — z-score(log1p)",
+      "Value — Raw", "Value — log1p", "Value — z-score(log1p)",
+      "Freight — Raw", "Freight — log1p", "Freight — z-score(log1p)"
+    ))
+  ) %>%
+  filter(is.finite(value))
+
+ggplot(money_hist, aes(x = value)) +
+  geom_histogram(bins = 40, color = hist_border, fill = hist_fill) +
+  facet_wrap(~ panel, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Order-level predictors: raw vs log1p vs z-score(log1p)",
+    x = NULL, y = "Frequency"
+  )
+```
+
+
+```{r}
+orders_model <- orders_model %>%
+  mutate(
+    log_items   = log1p(n_items),
+    log_value   = log1p(total_value),
+    log_freight = log1p(total_freight),
+
+    z_log_items   = as.numeric(scale(log_items)),
+    z_log_value   = as.numeric(scale(log_value)),
+    z_log_freight = as.numeric(scale(log_freight))
+  )
+```
+
+
+In our feature engineering, we first apply log1p to highly skewed positive predictors (e.g. order value, freight cost, shipment weight and volume) to reduce skewness and compress extreme values that would otherwise exert disproportionate influence on the fit. We then standardize these log‑transformed variables to z‑scores (mean 0, standard deviation 1), which places all continuous covariates on a common scale and improves the numerical conditioning of the mixed‑effects optimization. 
+
+These transformations are a reparameterization: they do not change the substantive fit of the model or its predictions, but they express coefficients in a common unit—the expected change in log‑delivery time associated with a one‑standard‑deviation increase in each predictor—thus enhancing interpretability and stability, which is particularly important when estimating crossed random intercepts for sellers and customer states.
+
+
+### 3.1.2 Outcome Transformation
+For the outcome, we compared the raw lead time with square‑root, log1p, and Winsorized variants using histograms. log1p(lead_time_days) yields a clearly more symmetric distribution than the raw or square‑root scales, while Winsorization mainly caps the most extreme values without resolving skewness. We therefore use log‑lead time as the main response, keeping trimming/Winsorization only for sensitivity checks
+
+```{r}
+orders_clean_core <- orders_clean_core %>%
+  mutate(
+    lead_time_days_raw = lead_time_days_raw,
+    log_lead_time  = log1p(lead_time_days_raw),
+    lead_sqrt   = sqrt(lead_time_days_raw),
+    lead_wins99 = pmin(lead_time_days_raw, trim_cut_99)
+  )
+
+par(mfrow = c(2, 2))
+
+hist(orders_clean_core$lead_time_days_raw,
+     breaks = 50,
+     main   = "Raw lead time",
+     xlab   = "days",
+     col    = hist_fill,
+     border = hist_border)
+
+hist(orders_clean_core$log_lead_time,
+     breaks = 50,
+     main   = "log1p(lead_time_days)",
+     xlab   = "log1p(days)",
+     col    = hist_fill,
+     border = hist_border)
+
+hist(orders_clean_core$lead_sqrt,
+     breaks = 50,
+     main   = "sqrt(lead_time_days)",
+     xlab   = "sqrt(days)",
+     col    = hist_fill,
+     border = hist_border)
+
+hist(orders_clean_core$lead_wins99,
+     breaks = 50,
+     main   = "Winsorized at 99th pct",
+     xlab   = "days (capped)",
+     col    = hist_fill,
+     border = hist_border)
+par(mfrow = c(1, 1))
+
+```
+
+Visual inspection shows that log1p(lead_time_days) produces a markedly more symmetric distribution than the raw or square‑root scale, while Winsorization mainly truncates the very largest values without fully addressing skewness. We therefore adopt the log‑transformed outcome for the main models and reserve trimming/Winsorization for robustness checks.
+
+```{r}
+orders_clean_core <- orders_clean_core %>%
+  mutate(
+    lead_time_days_raw = if_else(lead_time_days_raw < 0, NA_real_, lead_time_days_raw),
+    log_lead_time = log1p(lead_time_days_raw))
+
+
+orders_model <- orders_model %>%
+
+  select(-any_of(c("lead_time_days_raw", "log_lead_time", "lead_time_days"))) %>%
+  left_join(
+    orders_clean_core %>% select(order_id, lead_time_days_raw, log_lead_time),
+    by = "order_id"
+  )
+
+```
+## 3.2 Feature QA
+
+Quality checks confirm that the engineered dataset preserves the full analysis population: orders_model has exactly one row per order_id and no duplicates. Key predictors (customer_state, seller_state, weight, volume, value, freight, items) have no missing values after construction, while low-frequency, unknown, and theme-unmatched categories are consolidated into `other`. Lead time, shipment dimensions, and order value all show wide but plausible ranges, and shipment-level predictors display only moderate pairwise correlations (max approx. 0.78) with variance inflation factors between about 1.2 and 3.0, indicating that multicollinearity is not a concern. To avoid duplication, correlation interpretation is centralized in Section 4.2, while Section 3 keeps only construction QA checks.
+
+```{r}
+qa_counts <- tibble(
+  n_core  = nrow(orders_clean_core),
+  n_model = nrow(orders_model),
+  n_distinct_order_id = n_distinct(orders_model$order_id),
+  n_dup_order_id = nrow(orders_model) - n_distinct(orders_model$order_id)
+)
+
+qa_counts
+
+```
+
+```{r}
+qa_missing <- orders_model %>%
+  summarise(
+    pct_na_customer_state = mean(is.na(customer_state)) * 100,
+    pct_na_seller_state   = mean(is.na(seller_state)) * 100,
+
+    pct_na_total_weight_g   = mean(is.na(total_weight_g)) * 100,
+    pct_na_total_volume_cm3 = mean(is.na(total_volume_cm3)) * 100,
+    pct_na_total_value      = mean(is.na(total_value)) * 100,
+    pct_na_total_freight    = mean(is.na(total_freight)) * 100,
+    pct_na_n_items          = mean(is.na(n_items)) * 100,
+
+    pct_cat_other = mean(main_cat_pt_collapsed == "other", na.rm = TRUE) * 100,
+    pct_theme_unmapped = mean(theme_name == "Other (unmapped)", na.rm = TRUE) * 100,
+
+    pct_zero_weight = mean(total_weight_g == 0, na.rm = TRUE) * 100,
+    pct_zero_volume = mean(total_volume_cm3 == 0, na.rm = TRUE) * 100
+  )
+
+qa_missing
+```
+```{r}
+qa_summary <- orders_model %>%
+  summarise(
+    lead_p01 = quantile(lead_time_days_raw, 0.01, na.rm = TRUE),
+    lead_p50 = quantile(lead_time_days_raw, 0.50, na.rm = TRUE),
+    lead_p99 = quantile(lead_time_days_raw, 0.99, na.rm = TRUE),
+
+    wgt_p01 = quantile(total_weight_g, 0.01, na.rm = TRUE),
+    wgt_p50 = quantile(total_weight_g, 0.50, na.rm = TRUE),
+    wgt_p99 = quantile(total_weight_g, 0.99, na.rm = TRUE),
+
+    vol_p01 = quantile(total_volume_cm3, 0.01, na.rm = TRUE),
+    vol_p50 = quantile(total_volume_cm3, 0.50, na.rm = TRUE),
+    vol_p99 = quantile(total_volume_cm3, 0.99, na.rm = TRUE),
+
+    val_p01 = quantile(total_value, 0.01, na.rm = TRUE),
+    val_p50 = quantile(total_value, 0.50, na.rm = TRUE),
+    val_p99 = quantile(total_value, 0.99, na.rm = TRUE)
+  )
+
+qa_summary
+```
+```{r}
+library(car)
+lm_tmp <- lm(log_lead_time ~ log_wgt + log_vol + log_value + log_freight + log_items +  log_customer_pop + log_seller_pop,
+             data = orders_model)
+car::vif(lm_tmp)
+```
+
+## 3.3 Missingness handling
+
+Product weight and volume are occasionally missing or recorded as zero, but this affects only a small share of orders. We treat zero weight as invalid, create indicators for missing/zero dimensions, and impute log-weight and log-volume using category-specific medians (with a global median fallback), then standardize these imputed values. In parallel, we keep a stricter modeling subset that drops rows with missing `log_wgt`/`log_vol` and unmapped themes.
+
+```{r}
+# Recompute dimensions properly (all-NA -> NA, not 0)
+items_dim <- order_items %>%
+  semi_join(orders_clean_core %>% select(order_id), by = "order_id") %>%
+  left_join(
+    products %>%
+      select(product_id, product_weight_g, product_length_cm, product_height_cm, product_width_cm),
+    by = "product_id"
+  ) %>%
+  mutate(item_volume_cm3 = product_length_cm * product_height_cm * product_width_cm)
+
+order_dim_raw <- items_dim %>%
+  group_by(order_id) %>%
+  summarise(
+    total_weight_g = if (all(is.na(product_weight_g))) NA_real_ else sum(product_weight_g, na.rm = TRUE),
+    total_volume_cm3 = if (all(is.na(item_volume_cm3))) NA_real_ else sum(item_volume_cm3, na.rm = TRUE),
+
+    any_missing_weight = any(is.na(product_weight_g)),
+    any_missing_volume = any(is.na(item_volume_cm3)),
+    any_zero_weight    = any(!is.na(product_weight_g) & product_weight_g == 0),
+    .groups = "drop"
+  )
+
+orders_model <- orders_model %>%
+  select(-any_of(c("total_weight_g","total_volume_cm3","any_missing_weight","any_missing_volume","any_zero_weight",
+                   "log_wgt","log_vol","z_log_wgt","z_log_vol"))) %>%
+  left_join(order_dim_raw, by = "order_id")
+```
+
+
+```{r}
+orders_model <- orders_model %>%
+  mutate(
+    miss_wgt = is.na(total_weight_g) | total_weight_g == 0,   # treat 0 as invalid for weight
+    miss_vol = is.na(total_volume_cm3)                        # volume: usually missing not 0
+  ) %>%
+  mutate(
+    log_wgt = log1p(total_weight_g),
+    log_vol = log1p(total_volume_cm3)
+  )
+
+# category medians on log-scale (using observed only)
+med_by_cat <- orders_model %>%
+  group_by(main_cat_pt_collapsed) %>%
+  summarise(
+    med_log_wgt = median(log_wgt[!is.na(log_wgt) & is.finite(log_wgt)], na.rm = TRUE),
+    med_log_vol = median(log_vol[!is.na(log_vol) & is.finite(log_vol)], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# global fallback
+global_meds <- orders_model %>%
+  summarise(
+    g_med_log_wgt = median(log_wgt, na.rm = TRUE),
+    g_med_log_vol = median(log_vol, na.rm = TRUE)
+  )
+
+orders_model <- orders_model %>%
+  left_join(med_by_cat, by = "main_cat_pt_collapsed") %>%
+  mutate(
+    imp_wgt = miss_wgt,
+    imp_vol = miss_vol,
+
+    log_wgt_imp = if_else(miss_wgt, coalesce(med_log_wgt, global_meds$g_med_log_wgt), log_wgt),
+    log_vol_imp = if_else(miss_vol, coalesce(med_log_vol, global_meds$g_med_log_vol), log_vol)
+  ) %>%
+  # z-scores on the log1p scale (use mean/sd from observed log values, then apply)
+  mutate(
+    mu_log_wgt = mean(log_wgt, na.rm = TRUE),
+    sd_log_wgt = sd(log_wgt, na.rm = TRUE),
+    mu_log_vol = mean(log_vol, na.rm = TRUE),
+    sd_log_vol = sd(log_vol, na.rm = TRUE),
+
+    z_log_wgt = (log_wgt_imp - mu_log_wgt) / sd_log_wgt,
+    z_log_vol = (log_vol_imp - mu_log_vol) / sd_log_vol
+  ) %>%
+  select(-med_log_wgt, -med_log_vol, -mu_log_wgt, -sd_log_wgt, -mu_log_vol, -sd_log_vol)
+```
+
+
+```{r}
+# pct of imputed values
+orders_model %>%
+  summarise(
+    pct_imp_wgt = mean(imp_wgt) * 100,
+    pct_imp_vol = mean(imp_vol) * 100
+  )
+```
+
+Only about 2.3% of orders needed weight imputation and 1.7% needed volume imputation.
+
+```{r}
+orders_model_strict <- orders_model %>%
+  mutate(
+    log_wgt = log1p(total_weight_g),
+    log_vol = log1p(total_volume_cm3)
+  ) %>%
+  filter(
+    !is.na(log_wgt),
+    !is.na(log_vol),
+    theme_name != "Other (unmapped)"
+  ) %>%
+  mutate(
+    z_log_wgt = as.numeric(scale(log_wgt)),
+    z_log_vol = as.numeric(scale(log_vol))
+  )
+
+tibble(
+  n_main   = nrow(orders_model),
+  n_strict = nrow(orders_model_strict),
+  pct_kept = 100 * nrow(orders_model_strict) / nrow(orders_model)
+)
+```
+The strict complete-case dataset drops rows with missing weight/volume logs and unmapped themes; the retained share is reported in the table above.
+
+Missing values or zeros in product weight and volume were rare, affecting around 2% of orders. Our main analysis retained all orders by applying a simple median‑by‑category imputation with missingness indicators, a pragmatic approach for low levels of missingness in skewed covariates. As a robustness check, we also re-estimated on a stricter subset that excludes missing dimensions and unmapped themes.
+
+```{r}
+orders_eda <- orders_model %>%
+  transmute(
+    # IDs / grouping
+    order_id,
+    seller_id,
+    customer_state,
+    seller_state,
+    customer_region,
+    seller_region,
+    is_same_state,
+    is_same_region,
+    customer_state_pop_2017,
+    seller_state_pop_2017,
+    log_customer_pop,
+    log_seller_pop,
+    z_log_customer_pop,
+    z_log_seller_pop,
+
+    # time controls
+    purchase_ts,
+    purchase_year,
+    purchase_wday,
+    season,
+
+    # outcome
+    lead_time_days_raw,
+    delay_vs_estimated_days,
+    log_lead_time,
+
+    # predictors with log*
+    log_items,
+    log_value,
+    log_freight,
+    log_wgt,
+    log_vol,
+    # predictors with z-score
+    z_log_items,
+    z_log_value,
+    z_log_freight,
+    z_log_wgt,
+    z_log_vol,
+    # category
+    
+    is_hedonic,
+    is_experience,
+    theme_name,
+    
+    
+    
+    # for eda
+    n_items,
+    total_value,
+    total_freight,
+    total_weight_g,
+    total_volume_cm3
+   
+  )
+
+
+orders_eda %>%
+  summarise(
+    n = n(),
+    n_orders = n_distinct(order_id),
+    n_sellers = n_distinct(seller_id),
+    pct_na_y = mean(is.na(log_lead_time)) * 100
+  )
+
+# Theme names available in modeling table
+orders_eda %>%
+  count(theme_name, name = "n_orders") %>%
+  mutate(pct_orders = 100 * n_orders / sum(n_orders))
+```
+```{r}
+orders_eda_strict <- orders_model_strict %>%
+  transmute(
+    # IDs / grouping
+    order_id,
+    seller_id,
+    customer_state,
+    seller_state,
+    customer_region,
+    seller_region,
+    is_same_state,
+    is_same_region,
+    customer_state_pop_2017,
+    seller_state_pop_2017,
+    log_customer_pop,
+    log_seller_pop,
+    z_log_customer_pop,
+    z_log_seller_pop,
+
+    # time controls
+    purchase_ts,
+    purchase_year,
+    purchase_wday,
+    season,
+
+    # outcome
+    lead_time_days_raw,
+    delay_vs_estimated_days,
+    log_lead_time,
+
+    # predictors with log*
+    log_items,
+    log_value,
+    log_freight,
+    log_wgt,
+    log_vol,
+    # predictors with z-score
+    z_log_items,
+    z_log_value,
+    z_log_freight,
+    z_log_wgt,
+    z_log_vol,
+    # category
+    
+    is_hedonic,
+    is_experience,
+    theme_name,
+    
+    
+    
+    # for eda
+    n_items,
+    total_value,
+    total_freight,
+    total_weight_g,
+    total_volume_cm3
+   
+  )
+
+
+orders_eda %>%
+  summarise(
+    n = n(),
+    n_orders = n_distinct(order_id),
+    n_sellers = n_distinct(seller_id),
+    pct_na_y = mean(is.na(log_lead_time)) * 100
+  )
+
+# Theme names available in modeling table
+orders_eda_strict %>%
+  count(theme_name, name = "n_orders") %>%
+  mutate(pct_orders = 100 * n_orders / sum(n_orders))
+```
+
+
+
+```{r}
+# Lock analysis datasets for reproducibility
+
+dir.create("output", showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(orders_eda, "output/orders_eda.rds")
+saveRDS(orders_eda_strict, "output/orders_eda_strict.rds")
+
+readr::write_csv(orders_eda, "output/orders_eda.csv", na = "")
+readr::write_csv(orders_eda_strict, "output/orders_eda_strict.csv", na = "")
+
+tibble(
+  dataset = c("orders_eda", "orders_eda_strict"),
+  n_rows = c(nrow(orders_eda), nrow(orders_eda_strict)),
+  n_cols = c(ncol(orders_eda), ncol(orders_eda_strict)),
+  rds_path = c("output/orders_eda.rds", "output/orders_eda_strict.rds"),
+  csv_path = c("output/orders_eda.csv", "output/orders_eda_strict.csv")
+)
+```
+# 4. Exploratory Data Analysis
+
+This section focuses on interpretable relationships between delivery lead time and predictors. Dataset-construction checks (missingness, transformations, uniqueness, and VIF diagnostics) are reported in Section 3, and the locked `orders_eda` table is used here for outcome-oriented EDA.
+
+```{r}
+# load locked data
+# Optional shortcut for interactive work:
+# set TRUE to load saved analysis tables from output/ and continue from Section 4.
+use_locked_data <- TRUE
+
+if (use_locked_data) {
+  lock_orders <- "output/orders_eda.rds"
+  lock_strict <- "output/orders_eda_strict.rds"
+
+  stopifnot(file.exists(lock_orders), file.exists(lock_strict))
+
+  orders_eda <- readRDS(lock_orders)
+  orders_eda_strict <- readRDS(lock_strict)
+
+  message("Loaded locked data: orders_eda + orders_eda_strict from output/.")
+}
+```
+
+Before specifying the mixed‑effects models, we briefly examined how log‑lead time varies with key covariates. Same‑state shipments are delivered several days faster on average than cross‑state shipments, and there is clear between‑state heterogeneity in delivery times for both customer and seller states, supporting the use of random intercepts for geography. Binned plots of log‑lead time against the standardized log‑predictors (weight, volume, value, freight, items) show broadly monotone, approximately linear trends over most of the observed range, consistent with modelling these covariates as linear fixed effects. Together with the moderate correlations among predictors, this suggests that our transformed variables are suitable for inclusion in a multilevel regression without further feature engineering.
+
+
+
+```{r}
+orders_eda %>% 
+  summarise(
+    n_orders   = n(),
+    n_sellers  = n_distinct(seller_id),
+    n_states   = n_distinct(customer_state)
+  )
+```
+
+## 4.1 Delivery Lead Time vs predictors
+
+
+```{r}
+# Delivery lead time vs customer region
+orders_eda %>%
+  filter(!is.na(customer_region), !is.na(lead_time_days_raw)) %>%
+  mutate(customer_region = factor(customer_region,
+                                  levels = c("North", "Northeast", "Central-West", "Southeast", "South"))) %>%
+  ggplot(aes(x = customer_region, y = log_lead_time)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  labs(title = "Delivery lead time by customer region",
+       x = "Customer region", y = "Lead time (days)") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+orders_eda %>%
+  filter(!is.na(customer_region)) %>%
+  group_by(customer_region) %>%
+  summarise(
+    n = n(),
+    mean_delivery_days = mean(lead_time_days_raw, na.rm = TRUE),
+    median_delivery_days = median(lead_time_days_raw, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(customer_region)
+```
+
+Breaking down lead times by customer and seller region reveals clear geography patterns: the Southeast region (which includes SP, RJ, MG, ES) exhibits the lowest median delivery times (customer region: 8.75 days; seller region: 10.1 days), reflecting high seller density and short‑distance shipments. In contrast, the North and Northeast regions show substantially longer medians (North customer: 20.2 days; Northeast customer: 17.3 days), consistent with sparser logistics infrastructure and longer shipping distances from the predominantly Southeast‑based seller pool. Seller region patterns are less pronounced because 79,492 of 95,194 orders originate from Southeast sellers. These regional differences underscore the importance of including state‑level random effects and same‑region fixed effects to capture geography‑driven variation
+
+
+```{r}
+# Heterogeneity by state
+ggplot(orders_eda, aes(x = customer_state, y = log_lead_time)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  coord_flip() +
+  labs(
+    title = "log(lead time) by customer state",
+    x = "Customer state", y = "log1p(days)"
+  )
+ggplot(orders_eda, aes(x = seller_state, y = log_lead_time)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  coord_flip() +
+  labs(
+    title = "log(lead time) by seller state",
+    x = "Seller state", y = "log1p(days)"
+  )
+```
+The boxplots by customer state and seller state reveal substantial between‑state heterogeneity in median log‑delivery times: for example, São Paulo (SP) customers experience a median of about 7.2 raw days while customers in more remote states like Amazonas (AM) or Roraima (RR) see medians above 20 days. Similarly, sellers located in certain states systematically ship faster than others. The state‑level summary table confirms that SP—the most populated state—handles the largest volume (n = 39,927 orders) with the shortest median (7.22 days), whereas smaller or more distant states exhibit higher medians and 90th percentiles. This pronounced clustering by state and seller motivates the use of crossed random intercepts for customer_state and seller_id in our mixed‑effects models.
+
+
+
+```{r}
+state_summ <- orders_eda %>%
+  group_by(customer_state) %>%
+  summarise(
+    n = n(),
+    med_delivery_days = median(lead_time_days_raw, na.rm = TRUE),
+    p90_delivery_days = quantile(lead_time_days_raw, .90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n))
+
+state_summ
+```
+
+
+```{r}
+# Routing: same vs cross state/region
+eda_same_state <- orders_eda %>% 
+  count(is_same_state, name = "n") %>% 
+  left_join(
+    orders_eda %>% 
+      group_by(is_same_state) %>% 
+      summarise(
+        mean_delivery_days = mean(lead_time_days_raw, na.rm = TRUE),
+        med_delivery_days  = median(lead_time_days_raw, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "is_same_state"
+  )
+
+eda_same_state
+
+ggplot(orders_eda, aes(x = is_same_state, y = log_lead_time)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "Same-state vs cross-state delivery times",
+    x = "Same state?", y = "log1p(days)"
+  )
+
+```
+Comparing same‑ versus cross‑state shipments reveals a large and systematic routing effect: the median log‑lead time is visibly lower when buyer and seller share a state, and the same‑state distribution is tightly concentrated around lower values with less upper‑tail skew. A similar but slightly weaker pattern appears in the same‑region versus cross‑region contrast. The correlation table later confirms that is_same_state has a correlation of −0.493 with log‑lead time, the strongest univariate predictor in the data. This large gap motivates including is_same_state (and optionally is_same_region) as key routing indicators in Model 1 and beyond.
+
+
+
+```{r}
+#Shipment size and value predictors
+
+# simple correlations with outcome
+ship_vars <- c("z_log_wgt","z_log_vol","z_log_value","z_log_freight","z_log_items")
+cor_outcome <- orders_eda %>% 
+  select(log_lead_time, all_of(ship_vars)) %>% 
+  cor(use = "pairwise.complete.obs") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("var")
+
+cor_outcome
+
+#  log_lead_time vs each standardized predictor
+bin_means <- function(data, x, y = "log_lead_time", nbins = 20) {
+  x_sym <- rlang::sym(x); y_sym <- rlang::sym(y)
+  data %>% 
+    filter(is.finite(!!x_sym), is.finite(!!y_sym)) %>% 
+    mutate(bin = ntile(!!x_sym, nbins)) %>% 
+    group_by(bin) %>% 
+    summarise(
+      x_mid = mean(!!x_sym, na.rm = TRUE),
+      y_mean = mean(!!y_sym, na.rm = TRUE),
+      .groups = "drop"
+    ) %>% 
+    mutate(var = x)
+}
+
+binned_list <- map(ship_vars, ~bin_means(orders_eda, .x))
+binned_df   <- bind_rows(binned_list)
+
+ggplot(binned_df, aes(x = x_mid, y = y_mean)) +
+  geom_line() +
+  facet_wrap(~ var, scales = "free_x") +
+  labs(
+    title = "Binned mean log(lead time) vs standardized shipment predictors",
+    x = "z-score(log1p predictor)", y = "Mean log1p(days)"
+  ) +
+  theme_minimal()
+```
+The faceted binned‑mean curves show broadly monotone, approximately linear relationships between log‑lead time and the standardized log shipment predictors: heavier (z_log_wgt), bulkier (z_log_vol), higher‑value (z_log_value), higher‑freight (z_log_freight), and multi‑item (z_log_items) shipments all tend toward modestly longer delivery times. The trends are most pronounced for z_log_freight and z_log_value, while z_log_items shows only a weak gradient, consistent with the near‑zero correlation in the later correlation table. These patterns support including all five predictors linearly in the fixed‑effects part of the model.
+
+
+```{r}
+#Delivery lead time vs season -------------------------------------------------
+
+orders_eda %>% 
+  count(season, name = "n") %>% 
+  left_join(
+    orders_eda %>% 
+      group_by(season) %>% 
+      summarise(
+        mean_delivery_days = mean(lead_time_days_raw, na.rm = TRUE),
+        med_delivery_days  = median(lead_time_days_raw, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "season"
+  )
+
+ggplot(orders_eda, aes(x = season, y = log_lead_time)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "log(lead time) by season",
+    x = "Season (DJF/MAM/JJA/SON)", y = "log1p(days)"
+  )
+```
+Seasonal variation is moderate: the boxplot and summary table show that median lead times are highest in the December–January–February (DJF) period (12.9 days raw, mean 15.2) and lowest in June–July–August (JJA) (median 8.23 days, mean 9.77), consistent with end‑of‑year holiday demand spikes and mid‑year low‑demand periods. However, distributions overlap substantially and seasonal ranges are narrower than state‑level differences, suggesting that a four‑level season factor is an adequate coarse time control rather than a primary driver of variation
+
+
+```{r}
+## Delivery lead time vs product themes
+orders_eda %>%
+  filter(!is.na(theme_name), theme_name != "Other (unmapped)", !is.na(lead_time_days_raw)) %>%
+  mutate(theme_name = fct_reorder(theme_name, log_lead_time, median, na.rm = TRUE)) %>%
+  ggplot(aes(x = theme_name, y = log_lead_time)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  coord_flip() +
+  labs(title = "Delivery lead time by product theme",
+       x = "Product theme", y = "Lead time (days)")
+
+orders_eda %>%
+  filter(!is.na(theme_name), theme_name != "Other (unmapped)") %>%
+  group_by(theme_name) %>%
+  summarise(
+    n = n(),
+    mean = mean(lead_time_days_raw, na.rm = TRUE),
+    median = median(lead_time_days_raw, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n))
+```
+Grouping orders by product theme (combinations of search/experience and utilitarian/hedonic attributes) reveals modest but interpretable differences: Experience + Hedonic products (e.g. fashion, beauty) have slightly shorter median lead times (9.95 days) than Search + Utilitarian products (10.9 days), possibly because hedonic goods are lighter or prioritized in fulfillment. However, the theme distributions overlap substantially—means range only from 12.2 to 13.1 days across the four main themes—and sample sizes are large and balanced (10,062 to 28,535 orders per theme). Because theme_name collapses many sparse product categories into a small number of interpretable cells without inflating the parameter count, it provides a convenient way to control for product‑mix effects in the regression models.
+
+
+## 4.2 Correlation
+
+The correlation matrix among log shipment predictors shows moderate pairwise associations: log_wgt and log_vol correlate at 0.78 (expected, since heavier items tend to be bulkier), log_value and log_freight at 0.56 (both reflect shipment cost), and log_items correlates weakly with the size/value predictors (0.18–0.40). Despite these moderate correlations, no pair exceeds 0.80, and variance inflation factors (computed in Section 3) remain below 3.0, indicating that weight, volume, value, freight, and item count capture related but non‑redundant aspects of shipment characteristics and can be entered jointly as linear covariates without severe multicollinearity.
+
+The table of correlations between log_lead_time and key predictors highlights is_same_state as the dominant univariate predictor (r = −0.493), followed by log_freight (r = 0.340) and log_value (r = 0.150). Weight and volume show weak positive correlations with lead time (0.099 and 0.082), while log_items is nearly uncorrelated (−0.008). The correlation heatmap visually confirms these patterns: is_same_state clusters in a distinct block from the shipment‑size predictors, and freight and value form a moderately correlated subgroup. Together, these correlations motivate the progressive strategy in Section 5: isolate routing effects (M1), add shipment predictors (M2), add season/theme controls (M3), then test cluster-conditioned heterogeneity (M4).
+
+```{r}
+pred_cor <- orders_eda %>%
+  select(log_wgt, log_vol, log_value, log_freight, log_items) %>%
+  cor(use = "pairwise.complete.obs")
+
+pred_cor
+```
+
+
+```{r}
+pred_cor_mat <- pred_cor
+
+corrplot(
+  pred_cor_mat,
+  method = "color", type = "upper", order = "hclust",
+  tl.col = "black", tl.srt = 45, tl.cex = 0.6, number.cex = 0.6
+)
+```
+
+```{r s4_scatter_matrix, fig.width=8.6, fig.height=8.6}
+set.seed(2026)
+
+spm_vars <- c("log_lead_time", "log_wgt", "log_vol", "log_value", "log_freight", "log_items")
+spm_df <- orders_eda %>%
+  select(all_of(spm_vars)) %>%
+  drop_na()
+
+n_spm <- min(2200L, nrow(spm_df))
+idx_spm <- sample.int(nrow(spm_df), size = n_spm, replace = FALSE)
+spm_sample <- spm_df[idx_spm, , drop = FALSE]
+
+panel_cor <- function(x, y, digits = 2, prefix = "r=", ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- stats::cor(x, y, use = "complete.obs")
+  txt <- paste0(prefix, formatC(r, digits = digits, format = "f"))
+  text(0.5, 0.5, txt, cex = 1.05, col = "#0f766e")
+}
+
+panel_scatter <- function(x, y, ...) {
+  points(
+    x, y, pch = 16, cex = 0.32,
+    col = grDevices::adjustcolor("#2563eb", alpha.f = 0.18)
+  )
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) > 10) {
+    lines(stats::lowess(x[ok], y[ok], f = 2 / 3), col = "#d97706", lwd = 1.1)
+  }
+}
+
+pairs(
+  spm_sample[, spm_vars, drop = FALSE],
+  lower.panel = panel_scatter,
+  upper.panel = panel_cor,
+  main = paste0("Scatterplot matrix (sample n = ", n_spm, ")")
+)
+```
+
+```{r}
+y_cor <- orders_eda %>%
+  transmute(
+    log_lead_time,
+    log_wgt, log_vol, log_value, log_freight, log_items,
+    is_same_state = as.numeric(is_same_state), is_hedonic = as.numeric(is_hedonic),
+    is_experience = as.numeric(is_experience)
+  ) %>%
+  summarise(across(-log_lead_time, ~ cor(log_lead_time, .x, use = "pairwise.complete.obs"))) %>%
+  pivot_longer(everything(), names_to = "predictor", values_to = "cor_with_outcome") %>%
+  arrange(desc(abs(cor_with_outcome)))
+
+y_cor
+```
+
+
+
+```{r}
+corr_df_y <- orders_eda %>%
+  transmute(
+    log_lead_time,
+    log_wgt, log_vol, log_value, log_freight, log_items,
+    is_same_state = as.numeric(is_same_state), is_hedonic = as.numeric(is_hedonic),
+    is_experience = as.numeric(is_experience)
+  )
+
+cor_mat_y <- cor(corr_df_y, use = "pairwise.complete.obs")
+
+corrplot(
+  cor_mat_y,
+  method = "color", type = "upper", order = "hclust",
+  tl.col = "black", tl.srt = 45, tl.cex = 0.6, number.cex = 0.6
+)
+
+```
+
+
+## 4.3 Pre-model unsupervised clustering EDA
+### 4.3.1 Cluster Engineering
+```{r}
+orders_eda_strict <- orders_model_strict %>%
+  transmute(
+    # IDs / grouping
+    order_id,
+    seller_id,
+    customer_state,
+    seller_state,
+    customer_region,
+    seller_region,
+    is_same_state,
+    is_same_region,
+    customer_state_pop_2017,
+    seller_state_pop_2017,
+    log_customer_pop,
+    log_seller_pop,
+    z_log_customer_pop,
+    z_log_seller_pop,
+
+    # time controls
+    purchase_ts,
+    purchase_year,
+    purchase_wday,
+    season,
+
+    # outcome
+    lead_time_days_raw,
+    delay_vs_estimated_days,
+    log_lead_time,
+
+    # predictors with log*
+    log_items,
+    log_value,
+    log_freight,
+    log_wgt,
+    log_vol,
+
+    # predictors with z-score
+    z_log_items,
+    z_log_value,
+    z_log_freight,
+    z_log_wgt,
+    z_log_vol,
+
+    # product themes
+    is_hedonic,
+    is_experience,
+    theme_name,
+
+    # for EDA only
+    n_items,
+    total_value,
+    total_freight,
+    total_weight_g,
+    total_volume_cm3
+  )
+
+# 2. Quick sanity check on strict EDA table
+orders_eda_strict %>%
+  summarise(
+    n         = n(),
+    n_orders  = n_distinct(order_id),
+    n_sellers = n_distinct(seller_id),
+    pct_na_y  = mean(is.na(log_lead_time)) * 100
+  )
+
+# 3. Theme distribution before modelling filter
+orders_eda_strict %>%
+  count(theme_name, name = "n_orders") %>%
+  mutate(pct_orders = 100 * n_orders / sum(n_orders))
+```
+
+
+```{r}
+# Final Modeling dataset
+## --- Final modeling dataset used in all models: orders_mod ----
+# 4. Define final modelling dataset
+#    - drop rows with missing outcome
+#    - drop unmapped theme bucket (kept only for EDA)
+orders_mod <- orders_eda_strict %>%
+  filter(
+    !is.na(log_lead_time),
+    theme_name != "Other (unmapped)"
+  )
+
+# 5. Sanity checks on modelling sample
+orders_mod %>%
+  summarise(
+    n         = n(),
+    n_orders  = n_distinct(order_id),
+    n_sellers = n_distinct(seller_id),
+    pct_na_y  = mean(is.na(log_lead_time)) * 100
+  )
+
+orders_mod %>%
+  count(theme_name, name = "n_orders") %>%
+  mutate(pct_orders = 100 * n_orders / sum(n_orders))
+
+```
+
+```{r}
+glimpse(orders_mod)
+```
+
+
+
+Before fitting mixed-effects models, I run a **diagnostic** unsupervised clustering step to identify broad shipment regimes. This is used for EDA and model-design intuition only (e.g., interaction candidates), not as a causal modeling block.
+
+**Observe:** shipment predictors are multivariate, correlated, and heavy-tailed.  
+**Hypothesis H1:** the order-level shipment space is better represented by multiple latent groups than by one homogeneous cloud.  
+**Hypothesis H2:** a parsimonious number of groups can be selected consistently across model-based and geometry-based diagnostics.  
+**Confirm test:** Gaussian mixtures (`mclust`) with BIC/ICL for model-based selection, plus k-means silhouette as a geometric cross-check.  
+**Decision rule:** BIC/ICL are primary; silhouette and resampling stability are supporting diagnostics. If BIC/ICL peak at the maximum tested `G`, treat it as a boundary warning and run a focused guardrail sensitivity on `K \in \{3,4,5,6\}` using posterior uncertainty and cluster-balance diagnostics before selecting final `K`.
+
+```{r s5_precluster_setup, cache=TRUE}
+if (!requireNamespace("mclust", quietly = TRUE)) {
+  stop("Package 'mclust' is required for Section 4.3 pre-model clustering EDA.")
+}
+# `Mclust()` may evaluate `mclustBIC` in the caller frame in some environments.
+# Define a local alias so knitting works without attaching the whole package.
+if (!exists("mclustBIC", mode = "function")) {
+  mclustBIC <- mclust::mclustBIC
+}
+
+cluster_vars <- c(
+  "z_log_wgt", "z_log_vol", "z_log_value", "z_log_freight", "z_log_items"
+)
+G_grid_pre <- 1:10
+k_grid_pre <- 2:10
+
+delay_vec_pre <- if ("delay_vs_estimated_days" %in% names(orders_mod)) {
+  as.numeric(orders_mod$delay_vs_estimated_days)
+} else {
+  rep(NA_real_, nrow(orders_mod))
+}
+
+precluster_df <- orders_mod %>%
+  dplyr::mutate(row_id = dplyr::row_number()) %>%
+  dplyr::transmute(
+    row_id,
+    seller_id,
+    log_lead_time,
+    lead_time_days_raw,
+    is_hedonic = as.numeric(is_hedonic),
+    is_experience = as.numeric(is_experience),
+    n_items = as.numeric(n_items),
+    total_value = as.numeric(total_value),
+    total_freight = as.numeric(total_freight),
+    total_weight_g = as.numeric(total_weight_g),
+    total_volume_cm3 = as.numeric(total_volume_cm3),
+    delay_vs_estimated_days = delay_vec_pre,
+    log_wgt, log_vol, log_value, log_freight, log_items,
+    z_log_wgt, z_log_vol, z_log_value, z_log_freight, z_log_items,
+    is_same_state = as.numeric(is_same_state),
+    is_same_region = as.numeric(is_same_region)
+  )
+
+precluster_cc <- precluster_df %>%
+  dplyr::filter(dplyr::if_all(dplyr::all_of(cluster_vars), is.finite))
+
+if (nrow(precluster_cc) < 500) {
+  stop("Too few complete cases for stable pre-model clustering EDA.")
+}
+
+precluster_cc <- precluster_cc %>%
+  dplyr::mutate(
+    freight_per_kg_raw = total_freight / pmax(total_weight_g / 1000, 0.05),
+    value_density_raw = total_value / pmax(total_volume_cm3 / 1000, 0.10),
+    is_late_est = as.numeric(delay_vs_estimated_days > 0)
+  )
+
+cap_freight_perkg_pre <- if (all(!is.finite(precluster_cc$freight_per_kg_raw))) {
+  NA_real_
+} else {
+  as.numeric(stats::quantile(precluster_cc$freight_per_kg_raw, 0.99, na.rm = TRUE))
+}
+cap_value_density_pre <- if (all(!is.finite(precluster_cc$value_density_raw))) {
+  NA_real_
+} else {
+  as.numeric(stats::quantile(precluster_cc$value_density_raw, 0.99, na.rm = TRUE))
+}
+
+cap_freight_perkg_use <- if (is.finite(cap_freight_perkg_pre)) cap_freight_perkg_pre else Inf
+cap_value_density_use <- if (is.finite(cap_value_density_pre)) cap_value_density_pre else Inf
+
+precluster_cc <- precluster_cc %>%
+  dplyr::mutate(
+    freight_per_kg_brl = pmin(freight_per_kg_raw, cap_freight_perkg_use),
+    value_density_brl_l = pmin(value_density_raw, cap_value_density_use)
+  )
+
+X_pre <- as.matrix(precluster_cc[, cluster_vars, drop = FALSE])
+storage.mode(X_pre) <- "double"
+X_pre <- scale(X_pre)
+
+n_select <- min(4000L, nrow(precluster_cc))
+set.seed(42)
+idx_select <- sample(seq_len(nrow(precluster_cc)), size = n_select)
+X_select <- X_pre[idx_select, , drop = FALSE]
+```
+
+Here I setup chunk defines the clustering matrix (`X_pre`) from standardized shipment features and builds additional KPI variables for interpretation. The clustering fit uses only shipment features; KPI variables are used later to profile cluster meaning.
+
+```{r s5_precluster_selection, cache=TRUE}
+fit_pre_mclust <- mclust::Mclust(
+  X_select,
+  G = G_grid_pre,
+  modelNames = c("EII", "VII", "EEI", "VVI"),
+  verbose = FALSE
+)
+icl_pre <- mclust::mclustICL(
+  X_select,
+  G = G_grid_pre,
+  modelNames = c("EII", "VII", "EEI", "VVI")
+)
+
+pre_tidy_mclust_criterion <- function(obj, value_name) {
+  as.data.frame(as.matrix(unclass(obj)), stringsAsFactors = FALSE) %>%
+    tibble::rownames_to_column("G") %>%
+    dplyr::mutate(G = suppressWarnings(as.integer(G))) %>%
+    tidyr::pivot_longer(-G, names_to = "model", values_to = value_name) %>%
+    dplyr::filter(!is.na(G), is.finite(.data[[value_name]]))
+}
+
+bic_by_g_pre <- pre_tidy_mclust_criterion(fit_pre_mclust$BIC, "BIC") %>%
+  dplyr::group_by(G) %>%
+  dplyr::slice_max(BIC, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(delta_from_best = max(BIC) - BIC) %>%
+  dplyr::arrange(G)
+icl_by_g_pre <- pre_tidy_mclust_criterion(icl_pre, "ICL") %>%
+  dplyr::group_by(G) %>%
+  dplyr::slice_max(ICL, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(delta_from_best = max(ICL) - ICL) %>%
+  dplyr::arrange(G)
+
+sil_by_k_pre <- purrr::map_dfr(k_grid_pre, function(k) {
+  set.seed(100 + k)
+  km <- stats::kmeans(X_select, centers = k, nstart = 30, iter.max = 100)
+  sil <- cluster::silhouette(km$cluster, stats::dist(X_select))
+  tibble::tibble(
+    k = k,
+    avg_sil = mean(sil[, 3]),
+    tot_withinss = km$tot.withinss
+  )
+})
+
+k_bic_pre <- fit_pre_mclust$G
+k_icl_pre <- icl_by_g_pre %>%
+  dplyr::slice_min(delta_from_best, n = 1, with_ties = FALSE) %>%
+  dplyr::pull(G)
+k_sil_pre <- sil_by_k_pre %>%
+  dplyr::slice_max(avg_sil, n = 1, with_ties = FALSE) %>%
+  dplyr::pull(k)
+
+k_boundary_pre <- max(G_grid_pre)
+boundary_flag_pre <- any(c(k_bic_pre, k_icl_pre) == k_boundary_pre)
+model_select_pre <- fit_pre_mclust$modelName
+
+k_guardrail_pre <- sort(unique(intersect(c(3L, 4L, 5L, 6L), G_grid_pre)))
+if (length(k_guardrail_pre) == 0) {
+  k_guardrail_pre <- sort(unique(intersect(c(k_sil_pre, k_bic_pre, k_icl_pre), G_grid_pre)))
+}
+if (length(k_guardrail_pre) == 0) {
+  k_guardrail_pre <- sort(unique(pmax(2L, c(k_sil_pre, k_icl_pre))))
+}
+
+pre_guardrail_metrics <- purrr::map_dfr(k_guardrail_pre, function(k_now) {
+  fit_now <- tryCatch(
+    mclust::Mclust(X_pre, G = k_now, modelNames = model_select_pre, verbose = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(fit_now)) {
+    return(tibble::tibble(
+      k = as.integer(k_now),
+      mean_uncertainty = NA_real_,
+      p90_uncertainty = NA_real_,
+      pct_uncert_gt_0_20 = NA_real_,
+      min_cluster_pct = NA_real_,
+      max_cluster_pct = NA_real_,
+      n_small_clusters_lt5 = NA_integer_
+    ))
+  }
+
+  pred_now <- tryCatch(predict(fit_now, newdata = X_pre), error = function(e) NULL)
+  cl_now <- if (!is.null(pred_now$classification)) pred_now$classification else fit_now$classification
+  z_now <- if (!is.null(pred_now$z)) pred_now$z else fit_now$z
+  if (is.null(cl_now)) {
+    return(tibble::tibble(
+      k = as.integer(k_now),
+      mean_uncertainty = NA_real_,
+      p90_uncertainty = NA_real_,
+      pct_uncert_gt_0_20 = NA_real_,
+      min_cluster_pct = NA_real_,
+      max_cluster_pct = NA_real_,
+      n_small_clusters_lt5 = NA_integer_
+    ))
+  }
+
+  uncertainty_now <- if (!is.null(z_now)) 1 - apply(z_now, 1, max) else rep(NA_real_, length(cl_now))
+  size_now <- as.numeric(table(factor(cl_now, levels = seq_len(k_now))))
+  pct_now <- 100 * size_now / sum(size_now)
+
+  tibble::tibble(
+    k = as.integer(k_now),
+    mean_uncertainty = mean(uncertainty_now, na.rm = TRUE),
+    p90_uncertainty = stats::quantile(uncertainty_now, 0.90, na.rm = TRUE),
+    pct_uncert_gt_0_20 = 100 * mean(uncertainty_now > 0.20, na.rm = TRUE),
+    min_cluster_pct = min(pct_now),
+    max_cluster_pct = max(pct_now),
+    n_small_clusters_lt5 = sum(pct_now < 5)
+  )
+})
+
+pre_guardrails <- pre_guardrail_metrics %>%
+  dplyr::left_join(
+    bic_by_g_pre %>% dplyr::transmute(k = G, bic_delta = delta_from_best),
+    by = "k"
+  ) %>%
+  dplyr::left_join(
+    icl_by_g_pre %>% dplyr::transmute(k = G, icl_delta = delta_from_best),
+    by = "k"
+  ) %>%
+  dplyr::left_join(
+    sil_by_k_pre %>% dplyr::transmute(k, silhouette = avg_sil),
+    by = "k"
+  ) %>%
+  dplyr::mutate(
+    rank_bic = dplyr::dense_rank(bic_delta),
+    rank_icl = dplyr::dense_rank(icl_delta),
+    rank_sil = dplyr::dense_rank(dplyr::desc(silhouette)),
+    rank_unc = dplyr::dense_rank(mean_uncertainty),
+    rank_balance = dplyr::dense_rank(dplyr::desc(min_cluster_pct)),
+    rank_small = dplyr::dense_rank(n_small_clusters_lt5),
+    guardrail_score = rank_bic + rank_icl + rank_sil + rank_unc + rank_balance + rank_small
+  ) %>%
+  dplyr::arrange(guardrail_score, k) %>%
+  dplyr::mutate(recommend = dplyr::if_else(dplyr::row_number() == 1, "YES", "NO"))
+
+k_final_pre <- pre_guardrails %>%
+  dplyr::slice(1) %>%
+  dplyr::pull(k) %>%
+  as.integer()
+
+# Optional manual override (set to 3L/4L/5L/6L if needed for reporting sensitivity).
+# Current choice: K=5 to prioritize the strongest stability solution.
+k_override_pre <- 5L
+if (is.finite(k_override_pre) && k_override_pre %in% k_guardrail_pre) {
+  k_final_pre <- as.integer(k_override_pre)
+}
+
+pre_guardrails <- pre_guardrails %>%
+  dplyr::mutate(selected_final = dplyr::if_else(k == k_final_pre, "YES", "NO"))
+
+decision_rule_pre <- if (is.finite(k_override_pre) && k_override_pre %in% k_guardrail_pre) {
+  paste0(
+    "Stability-priority override: K=", k_final_pre,
+    " (best subsample ARI in candidate range)"
+  )
+} else {
+  "Guardrail score on K=3,4,5,6"
+}
+
+selection_pre <- tibble::tibble(
+  criterion = c(
+    "BIC (mclust)",
+    "ICL (mclust)",
+    "Silhouette (kmeans)",
+    "Candidate K range",
+    "Boundary warning",
+    "Final K used",
+    "Selected covariance model",
+    "Final decision rule"
+  ),
+  value = c(
+    as.character(k_bic_pre),
+    as.character(k_icl_pre),
+    as.character(k_sil_pre),
+    paste(range(k_guardrail_pre), collapse = " to "),
+    ifelse(boundary_flag_pre, "YES", "NO"),
+    as.character(k_final_pre),
+    model_select_pre,
+    decision_rule_pre
+  ),
+  note = c(
+    "best G under BIC",
+    "best G under ICL (stronger overlap penalty)",
+    "max mean silhouette on selection sample",
+    "focused sensitivity window for practical segmentation",
+    paste0("BIC/ICL reached G = ", k_boundary_pre, "?"),
+    "selected from combined fit/geometry/posterior/balance diagnostics",
+    "used for final mclust fit on full sample",
+    "if override is active, this supersedes rank-based recommendation"
+  )
+)
+```
+
+This chunk estimates candidate solutions and builds all selection diagnostics. `k_bic_pre`, `k_icl_pre`, and `k_sil_pre` are criterion-wise winners; `pre_guardrails` is the cross-criterion comparison table used to support final choice.
+
+```{r s5_precluster_selection_table}
+selection_pre
+```
+
+**Interpretation note:** `selection_pre` is the one-line audit trail. It records boundary warnings, candidate range, final selected `K`, and the explicit decision rule used in this run.
+
+```{r s5_precluster_guardrails_table}
+pre_guardrails
+```
+
+**Interpretation note:** in `pre_guardrails`, lower `guardrail_score` is better. Also inspect `mean_uncertainty`, `min_cluster_pct`, and `silhouette` directly so the selection is not driven by one metric.
+
+```{r s5_precluster_guardrails_plot, fig.height=4.8, fig.width=9.2}
+p_unc_pre <- ggplot(pre_guardrails, aes(x = k, y = mean_uncertainty)) +
+  geom_line(color = "#9a3412", linewidth = 0.95) +
+  geom_point(aes(color = selected_final), size = 2.4) +
+  scale_color_manual(values = c("YES" = "#0f766e", "NO" = "#9ca3af")) +
+  scale_x_continuous(breaks = sort(unique(pre_guardrails$k))) +
+  coord_cartesian(ylim = c(0, NA)) +
+  labs(
+    title = "Posterior uncertainty guardrail (candidate K)",
+    x = "Number of clusters (K)",
+    y = "Mean posterior uncertainty",
+    color = "Final K"
+  ) +
+  theme_minimal(base_size = 11)
+
+p_bal_pre <- ggplot(pre_guardrails, aes(x = k, y = min_cluster_pct)) +
+  geom_line(color = "#1d4ed8", linewidth = 0.95) +
+  geom_point(aes(color = selected_final), size = 2.4) +
+  scale_color_manual(values = c("YES" = "#0f766e", "NO" = "#9ca3af")) +
+  scale_x_continuous(breaks = sort(unique(pre_guardrails$k))) +
+  coord_cartesian(ylim = c(0, NA)) +
+  labs(
+    title = "Cluster-size guardrail (candidate K)",
+    x = "Number of clusters (K)",
+    y = "Smallest cluster size (%)",
+    color = "Final K"
+  ) +
+  theme_minimal(base_size = 11)
+
+gridExtra::grid.arrange(p_unc_pre, p_bal_pre, ncol = 2)
+```
+
+**Interpretation note:** the left panel should favor lower uncertainty, while the right panel should avoid very small minimum cluster shares. The highlighted point marks the final selected `K`.
+
+```{r s5_precluster_selection_plot, fig.height=8.2, fig.width=8.8}
+model_delta_pre <- dplyr::bind_rows(
+  bic_by_g_pre %>% dplyr::transmute(K = G, metric = "BIC", delta = delta_from_best),
+  icl_by_g_pre %>% dplyr::transmute(K = G, metric = "ICL", delta = delta_from_best)
+)
+
+p_model_pre <- ggplot(model_delta_pre, aes(x = K, y = delta, color = metric)) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey55") +
+  geom_line(linewidth = 0.95) +
+  geom_point(size = 2.2) +
+  geom_vline(xintercept = k_final_pre, linetype = 3, color = "#111827") +
+  annotate(
+    "text",
+    x = k_final_pre,
+    y = max(model_delta_pre$delta, na.rm = TRUE) * 0.93,
+    label = paste0("Final K=", k_final_pre),
+    color = "#111827",
+    hjust = -0.05,
+    size = 3.2
+  ) +
+  scale_color_manual(values = c("BIC" = "#1d4ed8", "ICL" = "#9333ea")) +
+  scale_x_continuous(breaks = G_grid_pre) +
+  labs(
+    title = "Model-based selection diagnostics (BIC/ICL)",
+    subtitle = "Plotted as Δ from best value for each criterion (lower is better)",
+    x = "Number of clusters (K)",
+    y = "Δ criterion value",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 11)
+
+p_sil_pre <- ggplot(sil_by_k_pre, aes(x = k, y = avg_sil)) +
+  geom_line(color = "#0f766e", linewidth = 0.95) +
+  geom_point(color = "#0f766e", size = 2.2) +
+  geom_vline(xintercept = k_sil_pre, linetype = 3, color = "#0f766e") +
+  geom_vline(xintercept = k_final_pre, linetype = 2, color = "#111827") +
+  scale_x_continuous(breaks = k_grid_pre) +
+  coord_cartesian(ylim = c(0, NA)) +
+  labs(
+    title = "Geometry cross-check (silhouette)",
+    subtitle = paste0("Best silhouette: K=", k_sil_pre, " | Final selected: K=", k_final_pre),
+    x = "Number of clusters (K)",
+    y = "Average silhouette width"
+  ) +
+  theme_minimal(base_size = 11)
+
+gridExtra::grid.arrange(p_model_pre, p_sil_pre, ncol = 1, heights = c(1.2, 1))
+```
+
+**Interpretation note:** top panel shows model-fit trends (BIC/ICL deltas; lower is better), bottom panel shows geometric separation (silhouette; higher is better). If BIC/ICL improve at the boundary, use this plot with guardrails/stability to justify a practical `K`.
+
+### 4.3.2 Cluster Profile
+```{r s5_precluster_fit_profile, cache=TRUE}
+# Fit the final selected model on full pre-clustering data.
+
+fit_pre_final <- mclust::Mclust(
+  X_pre,
+  G = k_final_pre,
+  modelNames = model_select_pre,
+  verbose = FALSE
+)
+pred_pre <- predict(fit_pre_final, newdata = X_pre)
+if (is.null(pred_pre$classification)) {
+  stop("mclust prediction did not return classifications.")
+}
+z_pre <- if (!is.null(pred_pre$z)) pred_pre$z else fit_pre_final$z
+
+profile_cols_pre <- c(
+  "seller_id", "is_hedonic", "is_experience",
+  "n_items", "total_value", "total_freight", "total_weight_g", "total_volume_cm3",
+  "delay_vs_estimated_days", "log_wgt", "log_vol", "log_value", "log_freight", "log_items"
+)
+
+if (!all(profile_cols_pre %in% names(precluster_cc))) {
+  profile_ref_pre <- orders_mod %>%
+    dplyr::mutate(row_id = dplyr::row_number()) %>%
+    dplyr::transmute(
+      row_id,
+      seller_id,
+      is_hedonic = as.numeric(is_hedonic),
+      is_experience = as.numeric(is_experience),
+      n_items = as.numeric(n_items),
+      total_value = as.numeric(total_value),
+      total_freight = as.numeric(total_freight),
+      total_weight_g = as.numeric(total_weight_g),
+      total_volume_cm3 = as.numeric(total_volume_cm3),
+      delay_vs_estimated_days = if ("delay_vs_estimated_days" %in% names(orders_mod)) {
+        as.numeric(delay_vs_estimated_days)
+      } else {
+        NA_real_
+      },
+      log_wgt, log_vol, log_value, log_freight, log_items
+    )
+
+  precluster_cc <- precluster_cc %>%
+    dplyr::select(-dplyr::any_of(profile_cols_pre)) %>%
+    dplyr::left_join(profile_ref_pre, by = "row_id")
+}
+
+if (!all(c("freight_per_kg_brl", "value_density_brl_l", "is_late_est") %in% names(precluster_cc))) {
+  precluster_cc <- precluster_cc %>%
+    dplyr::mutate(
+      freight_per_kg_raw = total_freight / pmax(total_weight_g / 1000, 0.05),
+      value_density_raw = total_value / pmax(total_volume_cm3 / 1000, 0.10),
+      is_late_est = as.numeric(delay_vs_estimated_days > 0)
+    )
+
+  cap_freight_fit_pre <- if (all(!is.finite(precluster_cc$freight_per_kg_raw))) {
+    NA_real_
+  } else {
+    as.numeric(stats::quantile(precluster_cc$freight_per_kg_raw, 0.99, na.rm = TRUE))
+  }
+  cap_density_fit_pre <- if (all(!is.finite(precluster_cc$value_density_raw))) {
+    NA_real_
+  } else {
+    as.numeric(stats::quantile(precluster_cc$value_density_raw, 0.99, na.rm = TRUE))
+  }
+
+  cap_freight_fit_use <- if (is.finite(cap_freight_fit_pre)) cap_freight_fit_pre else Inf
+  cap_density_fit_use <- if (is.finite(cap_density_fit_pre)) cap_density_fit_pre else Inf
+
+  precluster_cc <- precluster_cc %>%
+    dplyr::mutate(
+      freight_per_kg_brl = pmin(freight_per_kg_raw, cap_freight_fit_use),
+      value_density_brl_l = pmin(value_density_raw, cap_density_fit_use)
+    )
+}
+
+precluster_cc <- precluster_cc %>%
+  dplyr::mutate(
+    cluster_raw = pred_pre$classification,
+    cluster_uncertainty = 1 - apply(z_pre, 1, max)
+  )
+
+cluster_order_pre <- precluster_cc %>%
+  dplyr::group_by(cluster_raw) %>%
+  dplyr::summarise(
+    mean_ship_index = mean(z_log_wgt + z_log_vol + z_log_value + z_log_freight + z_log_items, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(mean_ship_index) %>%
+  dplyr::mutate(precluster = dplyr::row_number()) %>%
+  dplyr::select(cluster_raw, precluster)
+
+precluster_cc <- precluster_cc %>%
+  dplyr::select(-dplyr::any_of(c("precluster", "mean_ship_index"))) %>%
+  dplyr::left_join(cluster_order_pre, by = "cluster_raw") %>%
+  dplyr::mutate(
+    precluster = factor(
+      precluster,
+      levels = sort(unique(cluster_order_pre$precluster))
+    )
+  ) %>%
+  dplyr::select(-cluster_raw)
+
+orders_mod$precluster <- NA_character_
+orders_mod$precluster[precluster_cc$row_id] <- as.character(precluster_cc$precluster)
+orders_mod$precluster <- factor(orders_mod$precluster)
+
+precluster_profile <- precluster_cc %>%
+  dplyr::group_by(precluster) %>%
+  dplyr::summarise(
+    n_orders = dplyr::n(),
+    n_sellers = dplyr::n_distinct(seller_id),
+    median_orders_per_seller = median(as.numeric(table(seller_id))),
+    pct_sample = 100 * dplyr::n() / nrow(precluster_cc),
+    mean_lead_days = mean(lead_time_days_raw, na.rm = TRUE),
+    median_lead_days = median(lead_time_days_raw, na.rm = TRUE),
+    pct_same_state = 100 * mean(is_same_state, na.rm = TRUE),
+    pct_same_region = 100 * mean(is_same_region, na.rm = TRUE),
+    pct_hedonic = 100 * mean(is_hedonic == 1, na.rm = TRUE),
+    pct_experience = 100 * mean(is_experience == 1, na.rm = TRUE),
+    median_freight_per_kg_brl = median(freight_per_kg_brl, na.rm = TRUE),
+    median_value_density_brl_l = median(value_density_brl_l, na.rm = TRUE),
+    median_delay_vs_est_days = dplyr::if_else(
+      all(!is.finite(delay_vs_estimated_days), na.rm = TRUE),
+      NA_real_,
+      median(delay_vs_estimated_days, na.rm = TRUE)
+    ),
+    pct_late_vs_est = dplyr::if_else(
+      all(is.na(is_late_est)),
+      NA_real_,
+      100 * mean(is_late_est == 1, na.rm = TRUE)
+    ),
+    median_weight_kg = median(expm1(log_wgt) / 1000, na.rm = TRUE),
+    median_volume_l = median(expm1(log_vol) / 1000, na.rm = TRUE),
+    median_order_value_brl = median(expm1(log_value), na.rm = TRUE),
+    median_freight_brl = median(expm1(log_freight), na.rm = TRUE),
+    median_items = median(expm1(log_items), na.rm = TRUE),
+    mean_z_wgt = mean(z_log_wgt, na.rm = TRUE),
+    mean_z_vol = mean(z_log_vol, na.rm = TRUE),
+    mean_z_value = mean(z_log_value, na.rm = TRUE),
+    mean_z_freight = mean(z_log_freight, na.rm = TRUE),
+    mean_z_items = mean(z_log_items, na.rm = TRUE),
+    mean_uncertainty = mean(cluster_uncertainty, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(precluster)
+
+precluster_summary <- precluster_profile %>%
+  dplyr::transmute(
+    precluster,
+    n_orders,
+    n_sellers,
+    median_orders_per_seller,
+    pct_sample,
+    median_lead_days,
+    pct_late_vs_est,
+    median_delay_vs_est_days,
+    pct_same_state,
+    pct_same_region,
+    pct_hedonic,
+    pct_experience,
+    median_weight_kg,
+    median_volume_l,
+    median_freight_per_kg_brl,
+    median_value_density_brl_l,
+    median_order_value_brl,
+    median_freight_brl,
+    median_items,
+    mean_uncertainty
+  )
+```
+
+We fit the final `mclust` model on full data, assigns clusters, computes posterior uncertainty, and builds interpretable profile summaries for each cluster.
+
+```{r s5_precluster_profile_table}
+precluster_profile
+```
+
+**Interpretation note:** use `precluster_profile` for full technical detail. Report medians (days, weight, freight, value, items, delay) and shares (same-state, same-region, late) to describe each regime in operational terms.
+
+```{r s5_precluster_summary_table}
+precluster_summary
+```
+
+```{r s5_precluster_scatter_matrix, fig.width=8.8, fig.height=8.8}
+set.seed(2026)
+
+spm_cl_vars <- c("z_log_wgt", "z_log_vol", "z_log_value", "z_log_freight", "z_log_items")
+spm_cl_df <- precluster_cc %>%
+  dplyr::select(dplyr::all_of(spm_cl_vars), precluster) %>%
+  dplyr::filter(!is.na(precluster)) %>%
+  dplyr::filter(dplyr::if_all(dplyr::all_of(spm_cl_vars), is.finite))
+
+spm_cl_sample <- spm_cl_df %>%
+  dplyr::group_by(precluster) %>%
+  dplyr::group_modify(~ {
+    n_take <- min(650L, nrow(.x))
+    .x[sample.int(nrow(.x), size = n_take, replace = FALSE), , drop = FALSE]
+  }) %>%
+  dplyr::ungroup()
+
+cl_levels <- levels(droplevels(spm_cl_sample$precluster))
+cl_palette <- c("#1d4ed8", "#0f766e", "#d97706", "#b91c1c", "#7c3aed", "#ec4899")
+cl_col_map <- stats::setNames(
+  grDevices::adjustcolor(cl_palette[seq_along(cl_levels)], alpha.f = 0.30),
+  cl_levels
+)
+pt_col_cl <- cl_col_map[as.character(spm_cl_sample$precluster)]
+
+panel_cor_cl <- function(x, y, digits = 2, prefix = "r=", ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- stats::cor(x, y, use = "complete.obs")
+  txt <- paste0(prefix, formatC(r, digits = digits, format = "f"))
+  text(0.5, 0.5, txt, cex = 1.0, col = "#0f766e")
+}
+
+panel_scatter_cl <- function(x, y, ...) {
+  points(x, y, pch = 16, cex = 0.30, col = pt_col_cl)
+}
+
+pairs(
+  spm_cl_sample[, spm_cl_vars, drop = FALSE],
+  lower.panel = panel_scatter_cl,
+  upper.panel = panel_cor_cl,
+  main = paste0("Cluster-colored scatterplot matrix (balanced sample n = ", nrow(spm_cl_sample), ")")
+)
+legend(
+  "topright",
+  legend = paste("Cluster", cl_levels),
+  col = grDevices::adjustcolor(cl_palette[seq_along(cl_levels)], alpha.f = 0.85),
+  pch = 16, bty = "n", cex = 0.85
+)
+```
+
+This cluster-colored matrix complements the PCA plot by showing pairwise shipment-feature structure directly in the original standardized variables. Clusters partially overlap, but they occupy different high-density zones, especially on the weight-volume and value-freight axes, which is consistent with using clusters for heterogeneity modeling rather than as perfectly separated classes.
+
+
+```{r s5_precluster_stability, cache=TRUE}
+set.seed(2026)
+B_stab_pre <- 12
+frac_stab_pre <- 0.70
+n_stab_cap_pre <- min(12000L, nrow(X_pre))
+idx_stab_pool_pre <- sort(sample.int(nrow(X_pre), size = n_stab_cap_pre, replace = FALSE))
+X_stab_pre <- X_pre[idx_stab_pool_pre, , drop = FALSE]
+k_stab_pre <- sort(unique(c(3L, 4L, 5L, 6L, k_final_pre)))
+
+stability_pre <- purrr::map_dfr(k_stab_pre, function(k_now) {
+  ari_vals <- purrr::map_dbl(seq_len(B_stab_pre), function(b) {
+    n_now <- nrow(X_stab_pre)
+    n_sub <- as.integer(max(500, floor(frac_stab_pre * n_now)))
+    idx1 <- sort(sample.int(n_now, size = n_sub, replace = FALSE))
+    idx2 <- sort(sample.int(n_now, size = n_sub, replace = FALSE))
+
+    fit1 <- tryCatch(
+      mclust::Mclust(X_stab_pre[idx1, , drop = FALSE], G = k_now, modelNames = model_select_pre, verbose = FALSE),
+      error = function(e) NULL
+    )
+    fit2 <- tryCatch(
+      mclust::Mclust(X_stab_pre[idx2, , drop = FALSE], G = k_now, modelNames = model_select_pre, verbose = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit1) || is.null(fit2)) return(NA_real_)
+
+    overlap <- intersect(idx1, idx2)
+    if (length(overlap) < max(120, 12 * k_now)) return(NA_real_)
+
+    cl1 <- fit1$classification[match(overlap, idx1)]
+    cl2 <- fit2$classification[match(overlap, idx2)]
+    mclust::adjustedRandIndex(cl1, cl2)
+  })
+
+  tibble::tibble(
+    k = k_now,
+    n_valid = sum(is.finite(ari_vals)),
+    mean_ari = mean(ari_vals, na.rm = TRUE),
+    median_ari = median(ari_vals, na.rm = TRUE),
+    q25_ari = quantile(ari_vals, 0.25, na.rm = TRUE),
+    q75_ari = quantile(ari_vals, 0.75, na.rm = TRUE),
+    n_pool = n_stab_cap_pre,
+    n_boot = B_stab_pre
+  )
+})
+```
+
+This chunk computes subsample stability via ARI for candidate `K`. Higher `mean_ari` and tighter IQR indicate more reproducible segmentation under resampling.
+
+```{r s5_precluster_stability_table}
+stability_pre
+```
+
+**Interpretation note:** check `n_valid` first (should be close to `n_boot`), then compare `mean_ari` and `q25_ari`. A robust choice should not rely on a high mean with a very low lower quartile.
+
+```{r s5_precluster_stability_plot, fig.height=4.6, fig.width=7.8}
+ggplot(stability_pre, aes(x = factor(k), y = mean_ari, fill = factor(k))) +
+  geom_col(alpha = 0.8) +
+  geom_errorbar(aes(ymin = q25_ari, ymax = q75_ari), width = 0.15) +
+  geom_hline(yintercept = 0.70, linetype = 2, color = "#1f2937") +
+  labs(
+    title = "Pre-model clustering stability (subsample ARI)",
+    subtitle = "Bars = mean ARI, error bars = IQR; dashed line marks ARI=0.70",
+    x = "Number of clusters (k)",
+    y = "Adjusted Rand Index"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+**Interpretation note:** bars above the dashed threshold (`ARI=0.70`) indicate acceptable stability; prefer the candidate with both high mean and narrow uncertainty (IQR).
+
+```{r s5_precluster_profile_heatmap, fig.height=8.8, fig.width=10.8}
+z_within_feature <- function(x) {
+  x_num <- as.numeric(x)
+  if (all(!is.finite(x_num))) {
+    rep(NA_real_, length(x_num))
+  } else {
+    as.numeric(scale(x_num))
+  }
+}
+
+ship_cols_pre <- c("mean_z_wgt", "mean_z_vol", "mean_z_value", "mean_z_freight", "mean_z_items")
+kpi_cols_pre <- c(
+  "median_lead_days", "pct_same_state", "pct_same_region",
+  "pct_hedonic", "pct_experience",
+  "median_weight_kg", "median_volume_l",
+  "median_order_value_brl", "median_freight_brl", "median_items",
+  "median_freight_per_kg_brl", "median_value_density_brl_l",
+  "pct_late_vs_est", "median_delay_vs_est_days", "mean_uncertainty"
+)
+
+ship_cols_use_pre <- intersect(ship_cols_pre, names(precluster_profile))
+kpi_cols_use_pre <- intersect(kpi_cols_pre, names(precluster_profile))
+
+precluster_heat_ship <- precluster_profile %>%
+  dplyr::select(precluster, dplyr::all_of(ship_cols_use_pre)) %>%
+  tidyr::pivot_longer(-precluster, names_to = "feature", values_to = "value") %>%
+  dplyr::group_by(feature) %>%
+  dplyr::mutate(value_std = z_within_feature(value)) %>%
+  dplyr::ungroup()
+
+precluster_heat_kpi <- precluster_profile %>%
+  dplyr::select(precluster, dplyr::all_of(kpi_cols_use_pre)) %>%
+  tidyr::pivot_longer(-precluster, names_to = "feature", values_to = "value") %>%
+  dplyr::group_by(feature) %>%
+  dplyr::mutate(value_std = z_within_feature(value)) %>%
+  dplyr::ungroup()
+
+p_heat_ship_pre <- ggplot(precluster_heat_ship, aes(x = feature, y = precluster, fill = value_std)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#0f766e", mid = "white", high = "#b91c1c", midpoint = 0,
+    na.value = "grey90"
+  ) +
+  labs(
+    title = "Shipment profile heatmap",
+    subtitle = "Mean z shipment features by cluster",
+    x = NULL,
+    y = "Cluster",
+    fill = "Std score"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 28, hjust = 1))
+
+p_heat_kpi_pre <- ggplot(precluster_heat_kpi, aes(x = feature, y = precluster, fill = value_std)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#0f766e", mid = "white", high = "#b91c1c", midpoint = 0,
+    na.value = "grey90"
+  ) +
+  labs(
+    title = "Operational KPI profile heatmap",
+    subtitle = "Interpretable KPI metrics standardized within feature",
+    x = NULL,
+    y = "Cluster",
+    fill = "Std score"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 28, hjust = 1))
+
+gridExtra::grid.arrange(p_heat_ship_pre, p_heat_kpi_pre, ncol = 1, heights = c(1, 1.35))
+```
+
+**Interpretation note:** colors are standardized within each feature, so this heatmap compares clusters relative to each feature’s own scale. Use it to label clusters as low/mid/high shipment intensity and to attach KPI differences.
+
+```{r s5_precluster_pca_plot, fig.height=5.4, fig.width=9.2}
+pca_pre <- stats::prcomp(X_pre, center = FALSE, scale. = FALSE)
+pca_var_pre <- (pca_pre$sdev^2) / sum(pca_pre$sdev^2)
+pca_df_pre <- tibble::tibble(
+  PC1 = pca_pre$x[, 1],
+  PC2 = pca_pre$x[, 2],
+  PC3 = pca_pre$x[, 3],
+  precluster = precluster_cc$precluster
+)
+
+n_plot_pca_pre <- min(25000L, nrow(pca_df_pre))
+set.seed(2026)
+idx_plot_pca_pre <- sample.int(nrow(pca_df_pre), size = n_plot_pca_pre, replace = FALSE)
+pca_df_plot_pre <- pca_df_pre[idx_plot_pca_pre, , drop = FALSE]
+
+cluster_levels_pre <- sort(unique(as.character(pca_df_plot_pre$precluster)))
+palette_pre <- c("#3b82f6", "#14b8a6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#0ea5e9", "#84cc16")
+if (length(cluster_levels_pre) > length(palette_pre)) {
+  palette_pre <- grDevices::hcl.colors(length(cluster_levels_pre), palette = "Dark 3")
+}
+col_map_pre <- stats::setNames(palette_pre[seq_along(cluster_levels_pre)], cluster_levels_pre)
+pt_col_pre <- grDevices::adjustcolor(col_map_pre[as.character(pca_df_plot_pre$precluster)], alpha.f = 0.32)
+
+if (requireNamespace("scatterplot3d", quietly = TRUE)) {
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par), add = TRUE)
+  par(mfrow = c(1, 2), mar = c(3.8, 3.8, 2.0, 1.0), oma = c(0.2, 0.1, 2.2, 0.1))
+
+  scatterplot3d::scatterplot3d(
+    x = pca_df_plot_pre$PC1,
+    y = pca_df_plot_pre$PC2,
+    z = pca_df_plot_pre$PC3,
+    color = pt_col_pre,
+    pch = 16,
+    cex.symbols = 0.33,
+    angle = 32,
+    box = FALSE,
+    grid = TRUE,
+    xlab = paste0("PC1 (", sprintf("%.1f", 100 * pca_var_pre[1]), "%)"),
+    ylab = paste0("PC2 (", sprintf("%.1f", 100 * pca_var_pre[2]), "%)"),
+    zlab = paste0("PC3 (", sprintf("%.1f", 100 * pca_var_pre[3]), "%)"),
+    main = "View A"
+  )
+
+  scatterplot3d::scatterplot3d(
+    x = pca_df_plot_pre$PC1,
+    y = pca_df_plot_pre$PC2,
+    z = pca_df_plot_pre$PC3,
+    color = pt_col_pre,
+    pch = 16,
+    cex.symbols = 0.33,
+    angle = 118,
+    box = FALSE,
+    grid = TRUE,
+    xlab = paste0("PC1 (", sprintf("%.1f", 100 * pca_var_pre[1]), "%)"),
+    ylab = paste0("PC2 (", sprintf("%.1f", 100 * pca_var_pre[2]), "%)"),
+    zlab = paste0("PC3 (", sprintf("%.1f", 100 * pca_var_pre[3]), "%)"),
+    main = "View B"
+  )
+
+  legend(
+    "topright",
+    legend = paste("Cluster", cluster_levels_pre),
+    col = col_map_pre[cluster_levels_pre],
+    pch = 16,
+    cex = 0.75,
+    bty = "n"
+  )
+
+  mtext(
+    paste0("Pre-model clusters in PCA space (static 3D views, sampled n=", n_plot_pca_pre, ")"),
+    outer = TRUE,
+    line = 0.35,
+    cex = 0.95,
+    font = 2
+  )
+} else {
+  ggplot(pca_df_plot_pre, aes(x = PC1, y = PC2, color = precluster)) +
+    geom_point(alpha = 0.22, size = 0.7) +
+    stat_ellipse(level = 0.70, linewidth = 0.6, show.legend = FALSE) +
+    labs(
+      title = "Pre-model clusters in PCA space (2D fallback)",
+      subtitle = "Install 'scatterplot3d' for static 3D views",
+      x = paste0("PC1 (", sprintf("%.1f", 100 * pca_var_pre[1]), "%)"),
+      y = paste0("PC2 (", sprintf("%.1f", 100 * pca_var_pre[2]), "%)"),
+      color = "Cluster"
+    ) +
+    theme_minimal(base_size = 11)
+}
+```
+
+**Interpretation note:** PCA is a visual diagnostic only. For PDF/LaTeX, use the static 3D twin-view figure above to check whether overlap in one projection separates under rotation; residual overlap does not invalidate clustering when stability and uncertainty diagnostics are strong.
+
+```{r s5_precluster_pca_3d_plot, fig.height=5.6, fig.width=9.2}
+n_plot3_pre <- min(25000L, nrow(pca_df_pre))
+set.seed(2026)
+idx_plot3_pre <- sample.int(nrow(pca_df_pre), size = n_plot3_pre, replace = FALSE)
+pca_df3_pre <- pca_df_pre[idx_plot3_pre, , drop = FALSE]
+
+if (requireNamespace("plotly", quietly = TRUE)) {
+  col_map_pre <- c(
+    "1" = "#3b82f6", "2" = "#14b8a6", "3" = "#f59e0b",
+    "4" = "#ef4444", "5" = "#8b5cf6", "6" = "#ec4899"
+  )
+
+  p3_pre <- plotly::plot_ly(
+    data = pca_df3_pre,
+    x = ~PC1, y = ~PC2, z = ~PC3,
+    color = ~precluster,
+    text = ~paste0("Cluster: ", precluster),
+    colors = col_map_pre,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 2.0, opacity = 0.35),
+    hovertemplate = paste(
+      "%{text}<br>",
+      "PC1: %{x:.2f}<br>",
+      "PC2: %{y:.2f}<br>",
+      "PC3: %{z:.2f}<extra></extra>"
+    )
+  )
+
+  p3_pre <- plotly::layout(
+    p3_pre,
+    title = paste0(
+      "Pre-model clusters in PCA space (3D, sampled n=", n_plot3_pre, ")"
+    ),
+    scene = list(
+      xaxis = list(title = paste0("PC1 (", sprintf("%.1f", 100 * pca_var_pre[1]), "%)")),
+      yaxis = list(title = paste0("PC2 (", sprintf("%.1f", 100 * pca_var_pre[2]), "%)")),
+      zaxis = list(title = paste0("PC3 (", sprintf("%.1f", 100 * pca_var_pre[3]), "%)"))
+    )
+  )
+  p3_pre
+} else {
+  message("Interactive 3D rotation is available in HTML when 'plotly' is installed.")
+}
+```
+
+**Interpretation note:** use the interactive 3D widget for rotation checks in HTML output. For PDF/LaTeX reporting, rely on the static 3D PCA figure above.
+
+```{r s5_precluster_outcome_boxplot, fig.height=4.6, fig.width=8.8}
+ggplot(precluster_cc, aes(x = precluster, y = log_lead_time, fill = precluster)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "Outcome check by pre-model cluster (diagnostic only)",
+    x = "Pre-model cluster",
+    y = "log1p(delivery days)",
+    fill = "Cluster"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+
+This section confirms meaningful latent structure in shipment space and supports using pre-model clusters as an engineering diagnostic before mixed-effects modelling.
+
+From model-based criteria, BIC and ICL improve up to the maximum tested range (`K=10`), so fit criteria alone do not give a clean interior optimum. Geometry gives a different signal: silhouette is highest at `K=3` (`0.350`) and declines afterward, with `K=5` (`0.282`) still slightly better than `K=4` (`0.275`) and clearly better than `K=6` (`0.250`).
+
+Guardrail diagnostics show the expected trade-off between parsimony and segmentation detail. `K=3` has the lowest posterior uncertainty (`0.071`) and strongest minimum cluster share (`21.0%`), while `K=5` remains acceptable on both uncertainty (`0.095`) and balance (`13.2%` smallest cluster), without creating tiny clusters (`<5%`).
+
+Stability is the strongest argument for the final choice in this experiment. Subsample ARI is highest at `K=5` (mean `0.960`, IQR `0.954` to `0.969`), compared with `K=3` (mean `0.930`) and much weaker behaviour for `K=4` (mean `0.678`). Based on this stability-priority objective, I select `K=5` as the final pre-model segmentation.
+
+In practical terms, this means I keep a finer but still interpretable shipment-regime partition that is highly reproducible under resampling. These clusters are used as diagnostic structure to inform model engineering (heterogeneity checks and interaction ideas), not as causal evidence by themselves; confirmatory inference remains in the mixed-effects models below.
+
+
+The two displays below convert the main EDA findings into decision-ready summaries: (i) how large the same-state routing gap is in raw days, and (ii) which predictors are most strongly associated with log lead time in univariate terms.
+
+```{r}
+eda_routing_gap <- orders_eda %>%
+  dplyr::filter(!is.na(lead_time_days_raw), !is.na(is_same_state)) %>%
+  dplyr::mutate(route_group = if_else(is_same_state, "Same-state", "Cross-state")) %>%
+  dplyr::group_by(route_group) %>%
+  dplyr::summarise(
+    n_orders = n(),
+    median_days = median(lead_time_days_raw, na.rm = TRUE),
+    mean_days = mean(lead_time_days_raw, na.rm = TRUE),
+    p90_days = quantile(lead_time_days_raw, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(route_group)
+
+eda_routing_gap
+```
+
+```{r fig.height=4.8, fig.width=8}
+y_cor_plot <- y_cor %>%
+  dplyr::mutate(
+    predictor = factor(predictor, levels = rev(predictor)),
+    direction = if_else(cor_with_outcome >= 0, "Positive", "Negative")
+  )
+
+ggplot(y_cor_plot, aes(x = cor_with_outcome, y = predictor, color = direction)) +
+  geom_vline(xintercept = 0, color = "grey70", linetype = 2) +
+  geom_segment(
+    aes(x = 0, xend = cor_with_outcome, y = predictor, yend = predictor),
+    linewidth = 0.8,
+    alpha = 0.8
+  ) +
+  geom_point(size = 2.5) +
+  geom_text(
+    aes(label = sprintf("%.3f", cor_with_outcome)),
+    hjust = ifelse(y_cor_plot$cor_with_outcome > 0, -0.15, 1.15),
+    size = 3.1
+  ) +
+  scale_color_manual(values = c("Negative" = "#1d4e89", "Positive" = "#9a3412")) +
+  labs(
+    title = "Predictor association with log delivery lead time (EDA)",
+    x = "Correlation with log_lead_time",
+    y = NULL,
+    color = NULL
+  ) +
+  coord_cartesian(xlim = c(min(y_cor_plot$cor_with_outcome, na.rm = TRUE) - 0.05, max(y_cor_plot$cor_with_outcome, na.rm = TRUE) + 0.08)) +
+  theme_minimal(base_size = 11)
+```
+
+Taken together, the EDA supports five modelling decisions for Section 5:
+(1) substantial clustering by seller and customer state, motivating crossed random intercepts;
+(2) a large routing contrast (same-state vs cross-state), so `is_same_state` and `is_same_region` must remain core fixed effects;
+(3) moderate but non-redundant shipment predictors, so weight/volume/value/freight/items are included jointly;
+(4) pre-model unsupervised structure in shipment space, with a stable \(K=5\) segmentation (highest subsample ARI among candidate \(K \in \{3,4,5,6\}\));
+(5) time and theme factors are relevant controls, but should be interpreted as adjustment terms rather than primary operational levers.
+
+This bridge is important: the clustering result is not treated as a standalone final model, but as evidence that coefficient heterogeneity is plausible. That directly motivates the `M4_c1` and `M4_c2` extensions tested in Section 5.2.5.
+
+# 5. Modelling
+## 5.1 Robust Multivariate Diagnostics
+
+
+Minimum Covariance Determinant (MCD) is a robust way to estimate the multivariate center and covariance of shipment predictors, using the most central subset of observations and downweighting extremes. Mahalanobis distance then measures how far each order is from that robust center while accounting for correlation and scale across predictors (distance is in MD\(^2\) units here).
+
+We use MCD + robust Mahalanobis distance because shipment variables are correlated and heavy-tailed, so classical covariance and Euclidean distance can be distorted by extremes. This gives a more stable outlier flag (`ship_outlier_mcd`) for robustness checks in later models.
+
+Interpretation of plots:
+- Distance plot: each vertical line is one order's robust MD\(^2\); values above the red chi-square cutoff are flagged multivariate outliers.
+- QQ plot: if points follow the 45-degree line, distances are close to a multivariate-normal reference; upward tail deviations indicate more extreme orders than normal expectation.
+
+```{r}
+# Keep only a compact numeric tail profile here; distribution and geography visuals are in Sections 3.1.2 and 4.1.
+orders_mod %>%
+  summarise(
+    n           = n(),
+    mean_days   = mean(lead_time_days_raw, na.rm = TRUE),
+    med_days    = median(lead_time_days_raw, na.rm = TRUE),
+    p90_days    = quantile(lead_time_days_raw, 0.90, na.rm = TRUE),
+    p95_days    = quantile(lead_time_days_raw, 0.95, na.rm = TRUE),
+    max_days    = max(lead_time_days_raw, na.rm = TRUE)
+  )
+```
+
+
+```{r}
+# robust location/scale for lead time
+lead_vec <- orders_mod$lead_time_days_raw
+
+alpha_trim <- 0.1
+trim_bounds <- stats::quantile(
+  lead_vec,
+  probs = c(alpha_trim, 1 - alpha_trim),
+  na.rm = TRUE,
+  names = FALSE
+)
+lead_wins <- pmax(pmin(lead_vec, trim_bounds[2]), trim_bounds[1])
+
+lead_summary <- tibble(
+  mean          = mean(lead_vec, na.rm = TRUE),
+  trimmed_mean  = mean(lead_vec, trim = alpha_trim, na.rm = TRUE),
+  wins_mean     = base::mean(lead_wins, na.rm = TRUE),
+  median        = median(lead_vec, na.rm = TRUE),
+  sd            = sd(lead_vec, na.rm = TRUE),
+  MAD           = mad(lead_vec, constant = 1, na.rm = TRUE),
+  IQR           = IQR(lead_vec, na.rm = TRUE)
+)
+
+lead_summary
+```
+Location:
+
+Mean lead time ≈ 12.6 days
+
+Trimmed mean (10%) ≈ 11.2 days
+
+Winsorized mean ≈ 11.7 days
+
+Median ≈ 10.25 days
+
+So the classical mean is about 2.3 days higher than the median and 1.4 days higher than the 10% trimmed mean. This tells us the upper tail pulls the mean noticeably upward.
+
+
+Spread:
+
+SD ≈ 9.58 days
+
+MAD ≈ 4.16 days
+
+IQR ≈ 8.99 days
+
+The robust MAD is less than half the SD, again reflecting a heavy right tail.
+
+
+```{r}
+# Robust multivariate outliers with rank-safe, regularized MCD
+
+ship_cols <- c("z_log_wgt", "z_log_vol",  "z_log_freight", "z_log_items")
+
+# Build complete-case shipment matrix
+ship_df <- orders_mod[, ship_cols, drop = FALSE]
+ship_keep_idx <- which(stats::complete.cases(ship_df))
+X <- as.matrix(ship_df[ship_keep_idx, , drop = FALSE])
+storage.mode(X) <- "double"
+
+# Remove degenerate columns and enforce full column rank
+X <- X[, apply(X, 2, stats::sd) > 1e-10, drop = FALSE]
+if (ncol(X) == 0L) {
+  stop("All shipment predictors were dropped as near-constant.")
+}
+
+qrX <- qr(X)
+if (qrX$rank == 0L) {
+  stop("Shipment predictor matrix has rank 0 after QR filtering.")
+}
+X <- X[, qrX$pivot[seq_len(qrX$rank)], drop = FALSE]
+
+if (nrow(X) <= ncol(X)) {
+  stop("Too few complete cases for MCD after filtering (need nrow(X) > ncol(X)).")
+}
+
+# Fit MCD and regularize covariance if needed
+set.seed(42)
+mcd_fit <- robustbase::covMcd(X, alpha = 0.75)
+
+S <- mcd_fit$cov
+eps <- 1e-8
+iter <- 0L
+while ((!is.finite(rcond(S)) || rcond(S) < 1e-10) && iter < 8L) {
+  S <- S + diag(eps, ncol(S))
+  eps <- eps * 10
+  iter <- iter + 1L
+}
+if (!is.finite(rcond(S)) || rcond(S) < 1e-10) {
+  stop("Regularized MCD covariance is still near-singular; check predictors.")
+}
+
+# Robust Mahalanobis distances (squared) and chi-square cutoff
+md_robust <- stats::mahalanobis(X, center = mcd_fit$center, cov = S)
+df_md <- ncol(X)
+cut_chi <- stats::qchisq(0.975, df = df_md)
+
+# Map outlier flags back to full modelling dataset
+orders_mod$ship_outlier_mcd <- FALSE
+orders_mod$ship_outlier_mcd[ship_keep_idx] <- md_robust > cut_chi
+
+outlier_share_mcd <- mean(orders_mod$ship_outlier_mcd)  # proportion flagged
+outlier_share_mcd
+```
+
+The estimated outlier share is `r sprintf("%.2f", 100 * outlier_share_mcd)`%. Under a 97.5% chi-square cutoff, this is clearly above the ~2.5% expected under near-Gaussian behavior, so the shipment-feature space is materially heavy-tailed.
+
+Intuitively, it means:
+
+- Most orders form a “normal cloud” of shipment profiles.
+- About `r sprintf("%.1f", 100 * outlier_share_mcd)`% sit clearly outside that cloud when considering variables jointly (not variable-by-variable).
+- So our data has a meaningful minority of unusual shipment combinations (e.g., very heavy + very high freight + multi-item), which can pull classical models.
+
+Important nuance: these are not automatically bad records; they are just atypical patterns.
+Also, with a 97.5% cutoff, a near-normal dataset would flag ~2.5%, so 9.6% suggests a heavier tail than normal.
+
+```{r s5_mcd_outlier_scatter_matrix, fig.width=8.8, fig.height=8.8}
+set.seed(2026)
+
+spm_out_vars <- c("log_lead_time", "z_log_wgt", "z_log_vol", "z_log_freight", "z_log_items")
+spm_out_df <- orders_mod %>%
+  dplyr::select(dplyr::all_of(spm_out_vars), ship_outlier_mcd) %>%
+  dplyr::filter(!is.na(ship_outlier_mcd)) %>%
+  dplyr::filter(dplyr::if_all(dplyr::all_of(spm_out_vars), is.finite))
+
+idx_non <- which(!spm_out_df$ship_outlier_mcd)
+idx_out <- which(spm_out_df$ship_outlier_mcd)
+
+n_non <- min(2600L, length(idx_non))
+n_out <- min(900L, length(idx_out))
+
+idx_keep <- c(
+  if (n_non > 0L) sample(idx_non, size = n_non, replace = FALSE) else integer(0),
+  if (n_out > 0L) sample(idx_out, size = n_out, replace = FALSE) else integer(0)
+)
+
+if (length(idx_keep) == 0L) {
+  stop("No rows available for outlier scatterplot matrix.")
+}
+
+spm_out_sample <- spm_out_df[idx_keep, , drop = FALSE]
+pt_col_out <- ifelse(
+  spm_out_sample$ship_outlier_mcd,
+  grDevices::adjustcolor("#b91c1c", alpha.f = 0.45),
+  grDevices::adjustcolor("#64748b", alpha.f = 0.22)
+)
+
+panel_cor_out <- function(x, y, digits = 2, prefix = "r=", ...) {
+  usr <- par("usr")
+  on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- stats::cor(x, y, use = "complete.obs")
+  txt <- paste0(prefix, formatC(r, digits = digits, format = "f"))
+  text(0.5, 0.5, txt, cex = 1.0, col = "#0f766e")
+}
+
+panel_scatter_out <- function(x, y, ...) {
+  points(x, y, pch = 16, cex = 0.30, col = pt_col_out)
+}
+
+pairs(
+  spm_out_sample[, spm_out_vars, drop = FALSE],
+  lower.panel = panel_scatter_out,
+  upper.panel = panel_cor_out,
+  main = paste0("MCD outlier overlay in shipment space (sample n = ", nrow(spm_out_sample), ")")
+)
+legend(
+  "topright",
+  legend = c("Non-outlier", "MCD outlier"),
+  col = c("#64748b", "#b91c1c"),
+  pch = 16, bty = "n", cex = 0.9
+)
+```
+
+The outlier-overlay matrix shows that MCD outliers are concentrated in the tails of the joint shipment distribution rather than forming a completely separate cloud. This supports the robustness strategy used later (robust sensitivity checks and model variants) instead of deleting all flagged observations by default.
+
+```{r}
+# Distance diagnostics for robust MD^2
+plot(
+  md_robust,
+  type = "h",
+  main = "Robust Mahalanobis distances (MCD, regularized)",
+  xlab = "Observation (complete-case shipment subset)",
+  ylab = "Distance^2"
+)
+abline(h = cut_chi, col = "red", lty = 2)
+
+qqplot(
+  stats::qchisq(ppoints(length(md_robust)), df = df_md),
+  sort(md_robust),
+  main = "Robust MD^2 vs Chi-square quantiles",
+  xlab = "Chi-square quantiles",
+  ylab = "Robust Mahalanobis distance^2"
+)
+abline(0, 1, col = "red", lty = 2)
+
+
+```
+
+Interpretation of the diagnostics: the QQ plot departs upward from the 45-degree reference in the right tail, so robust MD\(^2\) values are heavier-tailed than a chi-square reference. The distance plot shows a dense central mass plus a visible set of large spikes, indicating a non-trivial group of multivariate shipment outliers rather than a few isolated points. This matches the estimated outlier share (`r sprintf("%.2f", 100 * outlier_share_mcd)`%).
+
+```{r}
+# Compare log_lead_time for MCD outliers vs non-outliers
+orders_mod %>%
+  mutate(
+    ship_outlier_mcd = factor(
+      ship_outlier_mcd,
+      levels = c(FALSE, TRUE),
+      labels = c("Non-outlier", "MCD outlier")
+    )
+  ) %>%
+  ggplot(aes(x = ship_outlier_mcd, y = log_lead_time)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  theme_minimal() +
+  labs(
+    title = "log(lead time) for shipment MCD outliers vs others",
+    x = "MCD outlier status",
+    y = "log1p(days)"
+  )
+```
+The boxplot compares log1p(lead_time) between orders flagged as multivariate shipment outliers by MCD and all other orders. MCD identifies a subset of orders with unusual shipment profiles, but their delivery times are not systematically extreme.
+
+The medians and interquartile ranges of the two groups are very similar, and the overlap in whiskers and points is substantial. This indicates that although MCD outliers have unusual combinations of shipment characteristics, their delivery times are not systematically more extreme than the rest of the sample. Consequently, I keep these orders in the data and use robust-regression sensitivity plus mixed-model specification checks rather than deleting them.
+
+## 5.2 Models Engineering
+
+In this section, I treat the research questions as a sequence of modelling experiments using `orders_mod`:
+
+- Variance decomposition (M0) to quantify how much variability in log‑lead time is attributable to sellers and customer states via random intercepts.
+
+- Routing experiment (M1) to measure the effect of same‑state and same‑region shipments after accounting for the hierarchy.
+
+- Shipment experiment (M2) to assess how standardized shipment characteristics (weight, volume, value, freight, items) explain remaining variation.
+
+- Baseline full model (M3) adding seasonality, purchase year, and product themes.
+
+Then I extend the baseline with cluster-informed heterogeneity models:
+- `M4_c1`: add precluster main effects.
+- `M4_c2`: add precluster interactions for key routing and shipment terms.
+
+For interpretation, I use M3 as the reference baseline and `M4_c2` as the preferred heterogeneity specification.
+
+### 5.2.1 M0: Null model
+
+```{r}
+# Mixed-effects models M0–M3
+## Response: log_lead_time
+## Random effects: seller_id, customer_state
+
+
+##  Model M0 – Null model (variance decomposition)
+# Why: quantify how much variation is at seller vs customer_state level.
+
+mod_M0 <- lmer(
+  log_lead_time ~ 1 +
+    (1 | seller_id) +
+    (1 | customer_state),
+  data = orders_mod,
+  REML = TRUE
+)
+
+summary(mod_M0)
+
+# Variance components and ICC-style interpretation
+VarCorr(mod_M0)
+sigma_M0 <- sigma(mod_M0)^2  # residual variance
+```
+
+
+
+ This null model provides the baseline variance decomposition before any fixed predictors are added. It tells us how much delivery-time heterogeneity is attributable to seller-level and customer-state-level clustering versus within-group residual variation.
+
+Random intercept variances:
+
+Seller: 0.0589 (SD ≈ 0.243).
+
+Customer state:0.0691 (SD ≈ 0.263).
+
+Residual: 0.2316 (SD ≈ 0.481).
+
+
+Interpretation:
+
+- There is substantial variation in log‑lead time across both sellers and customer states even before adding any covariates.
+
+- Roughly speaking, the between‑state variability is similar in magnitude to the between‑seller variability, which supports your variance‑decomposition RQ about hierarchy
+
+Even without covariates, there is substantial heterogeneity in log‑lead time across both sellers and customer states, with between‑state and between‑seller variation of comparable magnitude.
+
+
+### 5.2.2 M1: Add routing
+
+```{r}
+## Model M1 – Add routing (same state / same region)
+# Why: test how much routing alone explains after accounting for hierarchy.
+
+mod_M1 <- lmer(
+  log_lead_time ~
+    is_same_state + is_same_region +
+    (1 | seller_id) +
+    (1 | customer_state),
+  data = orders_mod,
+  REML = TRUE
+)
+
+summary(mod_M1)
+```
+
+Adding routing indicators (`is_same_state`, `is_same_region`) tests whether geography alone explains meaningful variation in lead time after accounting for random intercepts. A negative same-state effect is consistent with faster within-state delivery.
+
+Key changes:
+
+- Random‑effect variances shrink:
+
+Seller SD: from 0.243 → 0.233.
+
+State SD: from 0.263 → 0.207.
+
+Residual SD: from 0.481 → 0.460.
+
+
+- Routing coefficients:
+
+is_same_stateTRUE ≈ -0.402, statistic significant.
+
+is_same_regionTRUE ≈ -0.094 statistic significant
+
+
+
+Interpretation:
+
+- Negative sign means faster deliveries (lower log‑lead time) for same‑state and same‑region shipments.
+
+- Effect sizes are large: same‑state alone corresponds roughly to exp(−0.40)≈0.67, i.e. about 33% shorter expected lead time, holding random effects fixed.
+
+- Likelihood ratio test M0 vs M1: Chisquare ≈8358 on 2 df, p < 2.2e‑16 → routing explains a huge chunk of structured variation.
+
+After including routing, same‑state shipments are on average about one‑third faster and same‑region shipments about 9% faster than cross‑region shipments, and routing alone explains roughly 14% of the variance in log‑lead time.
+
+
+### 5.2.3 M2: Add shipment predictors
+```{r}
+##  Model M2 – Add shipment predictors
+# Why: see how much of remaining variation is explained by shipment profile.
+
+mod_M2 <- lmer(
+  log_lead_time ~
+    is_same_state + is_same_region +
+    z_log_wgt + z_log_vol + z_log_value + z_log_freight + z_log_items +
+    (1 | seller_id) +
+    (1 | customer_state),
+  data = orders_mod,
+  REML = TRUE
+)
+
+summary(mod_M2)
+```
+
+This model adds shipment characteristics (weight, volume, value, freight, items) on top of routing. Changes in coefficients and fit relative to M1 show how much shipment composition explains additional lead-time variation.
+
+Key points:
+
+Random‑effect SDs shrink further:
+
+Seller: 0.233 → 0.228.
+
+State: 0.207 → 0.186.
+
+Residual: 0.460 → 0.459 (small change).
+
+
+Shipment effects:
+
+z_log_freight: strong positive (≈ 0.056, p < 2e‑16) → more expensive freight ↔ longer lead time, once routing is controlled.
+
+z_log_items: strong negative (≈ -0.036, p < 2e‑16) → orders with more items (relative to typical) tend to be delivered faster, possibly reflecting batching or different logistics channels.
+
+z_log_value: small positive but significant (≈ 0.009, p ≈ 0.002): higher‑value orders are slightly slower, conditional on other factors.
+
+Shipment characteristics significantly refine the model: higher freight cost predicts slower deliveries, while orders with more items tend to be delivered slightly faster, possibly reflecting different consolidation and handling practices.
+
+
+### 5.2.4 M3: Full model with time + product themes
+
+```{r}
+##Model M3 – Full model with time + themes
+# Why: control for seasonality, calendar year, and product themes.
+
+mod_M3 <- lmer(
+  log_lead_time ~
+    is_same_state + is_same_region +
+    z_log_wgt + z_log_vol + z_log_value + z_log_freight + z_log_items +
+    season + purchase_year + theme_name +
+    (1 | seller_id) +
+    (1 | customer_state),
+  data = orders_mod,
+  REML = TRUE
+)
+
+summary(mod_M3)
+```
+
+```{r s523_m3_metrics}
+vc_m2 <- as.data.frame(VarCorr(mod_M2))
+vc_m3 <- as.data.frame(VarCorr(mod_M3))
+
+sd_m2_seller <- vc_m2$sdcor[vc_m2$grp == "seller_id" & vc_m2$var1 == "(Intercept)"][1]
+sd_m2_state <- vc_m2$sdcor[vc_m2$grp == "customer_state" & vc_m2$var1 == "(Intercept)"][1]
+sd_m2_resid <- sigma(mod_M2)
+
+sd_m3_seller <- vc_m3$sdcor[vc_m3$grp == "seller_id" & vc_m3$var1 == "(Intercept)"][1]
+sd_m3_state <- vc_m3$sdcor[vc_m3$grp == "customer_state" & vc_m3$var1 == "(Intercept)"][1]
+sd_m3_resid <- sigma(mod_M3)
+
+m3_fixef_tbl <- broom.mixed::tidy(mod_M3, effects = "fixed")
+m3_r2 <- performance::r2(mod_M3)
+```
+
+Comment (M3): this is the fully adjusted pooled baseline specification. It controls for time and product mix and provides the benchmark for cluster-conditioned heterogeneity in `M4_c1` and `M4_c2`.
+
+- Random-effect dispersion continues to shrink from M2 to M3: seller SD `r sprintf("%.3f", sd_m2_seller)` \(\rightarrow\) `r sprintf("%.3f", sd_m3_seller)`, state SD `r sprintf("%.3f", sd_m2_state)` \(\rightarrow\) `r sprintf("%.3f", sd_m3_state)`, residual SD `r sprintf("%.3f", sd_m2_resid)` \(\rightarrow\) `r sprintf("%.3f", sd_m3_resid)`.
+- Baseline fit is stronger in fixed effects: marginal \(R^2 = `r sprintf("%.3f", m3_r2$R2_marginal)`\), conditional \(R^2 = `r sprintf("%.3f", m3_r2$R2_conditional)`\).
+- Core direction remains stable: same-state and same-region coefficients are negative; freight is positive; items are negative.
+- Time controls remain informative, with faster delivery relative to DJF in MAM/JJA/SON and negative year dummies for 2017/2018 versus 2016.
+- Theme effects are comparatively small versus routing and freight, so themes act mainly as adjustment controls rather than primary drivers.
+
+
+### 5.2.5 M4: Full model with Cluster-informed heterogeneity
+
+I now use the pre-model shipment clusters as a model-engineering diagnostic. The purpose is to test whether core effects in M3 (routing and shipment terms) are approximately constant across shipment regimes, or whether there is meaningful heterogeneity that should be acknowledged in interpretation.
+
+```{r s54_cluster_setup}
+orders_mod_cluster <- orders_mod %>%
+  dplyr::filter(!is.na(precluster)) %>%
+  dplyr::mutate(precluster = factor(precluster))
+
+orders_mod_cluster %>%
+  dplyr::count(precluster, name = "n_orders") %>%
+  dplyr::mutate(pct_sample = 100 * n_orders / sum(n_orders))
+```
+
+```{r s54_cluster_models}
+mod_M4_c1 <- lmer(
+  log_lead_time ~
+    is_same_state + is_same_region +
+    z_log_wgt + z_log_vol + z_log_value + z_log_freight + z_log_items +
+    season + purchase_year + theme_name +
+    precluster +
+    (1 | seller_id) +
+    (1 | customer_state),
+  data = orders_mod_cluster,
+  REML = TRUE
+)
+
+mod_M4_c2 <- lmer(
+  log_lead_time ~
+    is_same_state * precluster +
+    is_same_region +
+    z_log_wgt + z_log_vol + z_log_value +
+    z_log_freight * precluster +
+    z_log_items * precluster +
+    season + purchase_year + theme_name +
+    (1 | seller_id) +
+    (1 | customer_state),
+  data = orders_mod_cluster,
+  REML = TRUE
+)
+```
+
+```{r s54_cluster_compare_table}
+extract_r2_local <- function(model_obj) {
+  r2_obj <- performance::r2(model_obj)
+  tibble::tibble(
+    r2_marginal = unname(r2_obj[["R2_marginal"]]),
+    r2_conditional = unname(r2_obj[["R2_conditional"]])
+  )
+}
+
+mod_M3_base_ML_cluster <- update(mod_M3, data = orders_mod_cluster, REML = FALSE)
+mod_M4_c1_ML <- update(mod_M4_c1, REML = FALSE)
+mod_M4_c2_ML <- update(mod_M4_c2, REML = FALSE)
+
+cluster_model_tbl <- tibble::tibble(
+  model = c("M3_base", "M4_c1_precluster_main", "M4_c2_cluster_interactions"),
+  AIC = c(AIC(mod_M3_base_ML_cluster), AIC(mod_M4_c1_ML), AIC(mod_M4_c2_ML)),
+  BIC = c(BIC(mod_M3_base_ML_cluster), BIC(mod_M4_c1_ML), BIC(mod_M4_c2_ML)),
+  logLik = c(as.numeric(logLik(mod_M3_base_ML_cluster)),
+             as.numeric(logLik(mod_M4_c1_ML)),
+             as.numeric(logLik(mod_M4_c2_ML)))
+) %>%
+  dplyr::bind_cols(dplyr::bind_rows(
+    extract_r2_local(mod_M3),
+    extract_r2_local(mod_M4_c1),
+    extract_r2_local(mod_M4_c2)
+  )) %>%
+  dplyr::mutate(
+    delta_AIC = AIC - min(AIC),
+    delta_BIC = BIC - min(BIC)
+  ) %>%
+  dplyr::arrange(delta_AIC)
+
+cluster_model_tbl
+```
+
+```{r s54_cluster_lrt}
+lrt_base_vs_M4_c1 <- anova(mod_M3_base_ML_cluster, mod_M4_c1_ML)
+lrt_M4_c1_vs_M4_c2 <- anova(mod_M4_c1_ML, mod_M4_c2_ML)
+
+lrt_base_vs_M4_c1
+lrt_M4_c1_vs_M4_c2
+```
+
+```{r s54_cluster_interaction_terms}
+cluster_interaction_terms <- broom.mixed::tidy(mod_M4_c2, effects = "fixed", conf.int = TRUE) %>%
+  dplyr::filter(stringr::str_detect(term, "precluster")) %>%
+  dplyr::arrange(term)
+
+cluster_interaction_terms
+```
+
+```{r s54_cluster_stratified_models}
+cluster_key_terms <- c("is_same_stateTRUE", "is_same_regionTRUE", "z_log_freight", "z_log_items", "z_log_value")
+
+fit_cluster_stratified <- function(cluster_label) {
+  dat <- orders_mod_cluster %>%
+    dplyr::filter(precluster == cluster_label)
+
+  fit_try <- tryCatch(
+    lmer(
+      log_lead_time ~
+        is_same_state + is_same_region +
+        z_log_freight + z_log_items + z_log_value +
+        season + purchase_year + theme_name +
+        (1 | seller_id) + (1 | customer_state),
+      data = dat,
+      REML = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+  model_used <- "seller + state random intercepts"
+  if (is.null(fit_try)) {
+    fit_try <- tryCatch(
+      lmer(
+        log_lead_time ~
+          is_same_state + is_same_region +
+          z_log_freight + z_log_items + z_log_value +
+          season + purchase_year + theme_name +
+          (1 | seller_id),
+        data = dat,
+        REML = TRUE
+      ),
+      error = function(e) NULL
+    )
+    model_used <- "seller random intercept only"
+  }
+
+  if (is.null(fit_try)) {
+    return(tibble::tibble(
+      precluster = as.character(cluster_label),
+      model_used = "fit_failed",
+      term = NA_character_,
+      estimate = NA_real_,
+      std.error = NA_real_,
+      conf.low = NA_real_,
+      conf.high = NA_real_,
+      p.value = NA_real_
+    ))
+  }
+
+  broom.mixed::tidy(fit_try, effects = "fixed", conf.int = TRUE) %>%
+    dplyr::mutate(
+      precluster = as.character(cluster_label),
+      model_used = model_used
+    ) %>%
+    dplyr::select(precluster, model_used, term, estimate, std.error, conf.low, conf.high, p.value)
+}
+
+cluster_stratified_tbl <- purrr::map_dfr(levels(orders_mod_cluster$precluster), fit_cluster_stratified) %>%
+  dplyr::filter(term %in% cluster_key_terms)
+
+cluster_stratified_tbl
+```
+
+```{r s54_cluster_stratified_plot, fig.height=5.0, fig.width=9.2}
+cluster_term_labels <- c(
+  is_same_stateTRUE = "Same-state shipment",
+  is_same_regionTRUE = "Same-region shipment",
+  z_log_freight = "Freight cost (z log)",
+  z_log_items = "Item count (z log)",
+  z_log_value = "Order value (z log)"
+)
+
+plot_cluster_strata <- cluster_stratified_tbl %>%
+  dplyr::mutate(
+    term_label = factor(cluster_term_labels[term], levels = rev(unname(cluster_term_labels))),
+    precluster = factor(precluster, levels = sort(unique(precluster)))
+  )
+
+ggplot(plot_cluster_strata, aes(x = estimate, y = term_label, color = precluster)) +
+  geom_vline(xintercept = 0, color = "grey70", linetype = 2) +
+  geom_point(position = position_dodge(width = 0.55), size = 2.1) +
+  geom_errorbar(
+    aes(xmin = conf.low, xmax = conf.high),
+    width = 0,
+    position = position_dodge(width = 0.55),
+    alpha = 0.8
+  ) +
+  labs(
+    title = "Cluster-stratified sensitivity of key fixed effects",
+    subtitle = "Mixed-effects fits by pre-model shipment regime",
+    x = "Coefficient estimate (log lead-time scale)",
+    y = NULL,
+    color = "Precluster"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+Interpretation for this run:
+
+- The selected partition (`K = `r k_final_pre`) is usable for mixed modelling: cluster shares range from `r sprintf("%.1f", min(precluster_summary$pct_sample, na.rm = TRUE))`% to `r sprintf("%.1f", max(precluster_summary$pct_sample, na.rm = TRUE))`%.
+- Adding cluster main effects (`M4_c1`) improves fit versus M3 (\(\chi^2 = `r sprintf("%.2f", lrt_base_vs_M4_c1$Chisq[2])`\), \(df = `r lrt_base_vs_M4_c1$Df[2]`\), p `r {pv <- format.pval(lrt_base_vs_M4_c1[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16); if (startsWith(pv, "<")) pv else paste0("= ", pv)}`).
+- Adding interactions (`M4_c2`) gives a much larger gain (\(\chi^2 = `r sprintf("%.1f", lrt_M4_c1_vs_M4_c2$Chisq[2])`\), \(df = `r lrt_M4_c1_vs_M4_c2$Df[2]`\), p `r {pv <- format.pval(lrt_M4_c1_vs_M4_c2[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16); if (startsWith(pv, "<")) pv else paste0("= ", pv)}`) and improves AIC/BIC from `r sprintf("%.0f", cluster_model_tbl$AIC[cluster_model_tbl$model == "M3_base"])`/`r sprintf("%.0f", cluster_model_tbl$BIC[cluster_model_tbl$model == "M3_base"])` to `r sprintf("%.0f", cluster_model_tbl$AIC[cluster_model_tbl$model == "M4_c2_cluster_interactions"])`/`r sprintf("%.0f", cluster_model_tbl$BIC[cluster_model_tbl$model == "M4_c2_cluster_interactions"])`.
+- Marginal \(R^2\) increases from `r sprintf("%.3f", cluster_model_tbl$r2_marginal[cluster_model_tbl$model == "M3_base"])` (M3) to `r sprintf("%.3f", cluster_model_tbl$r2_marginal[cluster_model_tbl$model == "M4_c2_cluster_interactions"])` (M4\_c2), while conditional \(R^2\) moves from `r sprintf("%.3f", cluster_model_tbl$r2_conditional[cluster_model_tbl$model == "M3_base"])` to `r sprintf("%.3f", cluster_model_tbl$r2_conditional[cluster_model_tbl$model == "M4_c2_cluster_interactions"])`.
+- Direction is stable but magnitude is regime-specific: same-state effects are negative in every cluster (`r sprintf("%.3f", min(cluster_stratified_tbl$estimate[cluster_stratified_tbl$term == "is_same_stateTRUE"], na.rm = TRUE))` to `r sprintf("%.3f", max(cluster_stratified_tbl$estimate[cluster_stratified_tbl$term == "is_same_stateTRUE"], na.rm = TRUE))`), while freight effects stay positive (`r sprintf("%.3f", min(cluster_stratified_tbl$estimate[cluster_stratified_tbl$term == "z_log_freight"], na.rm = TRUE))` to `r sprintf("%.3f", max(cluster_stratified_tbl$estimate[cluster_stratified_tbl$term == "z_log_freight"], na.rm = TRUE))`).
+  
+## 5.3 Model comparison and final selection
+
+```{r}
+# Likelihood ratio test M0 vs M1 (REML off for fair comparison)
+mod_M0_ML <- update(mod_M0, REML = FALSE)
+mod_M1_ML <- update(mod_M1, REML = FALSE)
+lrt_M0_M1 <- anova(mod_M0_ML, mod_M1_ML)
+lrt_M0_M1
+
+mod_M2_ML <- update(mod_M2, REML = FALSE)
+lrt_M1_M2 <- anova(mod_M1_ML, mod_M2_ML)
+lrt_M1_M2
+
+mod_M3_ML <- update(mod_M3, REML = FALSE)
+lrt_M2_M3 <- anova(mod_M2_ML, mod_M3_ML)
+lrt_M2_M3
+
+# M3 vs M4 comparison on common cluster-ready sample
+lrt_base_vs_M4_c1
+lrt_M4_c1_vs_M4_c2
+```
+
+Model comparison takeaway:
+
+- M1 \(\rightarrow\) M2 is strongly supported (\(\chi^2 = `r sprintf("%.1f", lrt_M1_M2$Chisq[2])`\), \(df = `r lrt_M1_M2$Df[2]`\), p `r {pv <- format.pval(lrt_M1_M2[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16); if (startsWith(pv, "<")) pv else paste0("= ", pv)}`); shipment variables add clear explanatory value beyond routing.
+- M2 \(\rightarrow\) M3 is also strongly supported (\(\chi^2 = `r sprintf("%.1f", lrt_M2_M3$Chisq[2])`\), \(df = `r lrt_M2_M3$Df[2]`\), p `r {pv <- format.pval(lrt_M2_M3[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16); if (startsWith(pv, "<")) pv else paste0("= ", pv)}`); time and theme controls matter materially.
+- On the common cluster-ready sample, M3 \(\rightarrow\) M4\_c1 and M4\_c1 \(\rightarrow\) M4\_c2 are both decisively supported (`r format.pval(lrt_base_vs_M4_c1[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16)` and `r format.pval(lrt_M4_c1_vs_M4_c2[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16)`), confirming non-trivial cluster-conditioned heterogeneity.
+- Final choice: `M4_c2_cluster_interactions` is the preferred inferential model; M3 remains the pooled baseline comparator.
+
+```{r}
+##  Model fit diagnostics and R²
+
+# Marginal and conditional R² for each model
+R2_M0 <- performance::r2(mod_M0)
+R2_M1 <- performance::r2(mod_M1)
+R2_M2 <- performance::r2(mod_M2)
+R2_M3 <- performance::r2(mod_M3)
+
+R2_M0
+R2_M1
+R2_M2
+R2_M3
+```
+
+```{r}
+extract_r2 <- function(model) {
+  r2_obj <- performance::r2(model)
+  tibble::tibble(
+    r2_marginal = unname(r2_obj[["R2_marginal"]]),
+    r2_conditional = unname(r2_obj[["R2_conditional"]])
+  )
+}
+
+model_list_ml <- list(
+  M0 = mod_M0_ML,
+  M1 = mod_M1_ML,
+  M2 = mod_M2_ML,
+  M3 = mod_M3_ML
+)
+
+model_compare_tbl <- tibble::tibble(
+  model = names(model_list_ml),
+  AIC = sapply(model_list_ml, AIC),
+  BIC = sapply(model_list_ml, BIC),
+  logLik = sapply(model_list_ml, function(m) as.numeric(logLik(m)))
+) %>%
+  dplyr::bind_cols(dplyr::bind_rows(lapply(model_list_ml, extract_r2))) %>%
+  dplyr::mutate(
+    delta_AIC = AIC - min(AIC),
+    delta_BIC = BIC - min(BIC)
+  )
+
+model_compare_tbl
+```
+
+For the final model decision, the key comparison is M3 versus M4 on the common cluster-ready sample:
+
+```{r}
+cluster_model_tbl %>%
+  dplyr::mutate(
+    selected_final = dplyr::if_else(
+      model == "M4_c2_cluster_interactions",
+      "YES",
+      "NO"
+    )
+  ) %>%
+  dplyr::arrange(delta_AIC, delta_BIC)
+```
+
+```{r fig.height=4.6, fig.width=8}
+model_r2_plot <- model_compare_tbl %>%
+  dplyr::select(model, r2_marginal, r2_conditional) %>%
+  tidyr::pivot_longer(
+    cols = c(r2_marginal, r2_conditional),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    metric = factor(
+      metric,
+      levels = c("r2_marginal", "r2_conditional"),
+      labels = c("Marginal R² (fixed effects)", "Conditional R² (fixed + random)")
+    )
+  )
+
+ggplot(model_r2_plot, aes(x = model, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_text(
+    aes(label = sprintf("%.3f", value)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.3,
+    size = 3
+  ) +
+  scale_fill_manual(values = c("Marginal R² (fixed effects)" = "#2563eb", "Conditional R² (fixed + random)" = "#0f766e")) +
+  labs(
+    title = "Model progression: variance explained across M0-M3",
+    x = "Model",
+    y = "R²",
+    fill = NULL
+  ) +
+  coord_cartesian(ylim = c(0, max(model_r2_plot$value, na.rm = TRUE) + 0.08)) +
+  theme_minimal(base_size = 11)
+```
+
+```{r fig.height=4.8, fig.width=8}
+m3_key_terms <- c("is_same_stateTRUE", "is_same_regionTRUE", "z_log_freight", "z_log_items", "seasonJJA")
+m3_term_labels <- c(
+  is_same_stateTRUE = "Same-state shipment",
+  is_same_regionTRUE = "Same-region shipment",
+  z_log_freight = "Freight cost (z log)",
+  z_log_items = "Item count (z log)",
+  seasonJJA = "Season: JJA (vs DJF)"
+)
+
+m3_key_effects <- broom.mixed::tidy(
+  mod_M3_ML,
+  effects = "fixed",
+  conf.int = TRUE,
+  conf.method = "Wald"
+) %>%
+  dplyr::filter(term %in% m3_key_terms) %>%
+  dplyr::mutate(
+    term_label = factor(m3_term_labels[term], levels = rev(unname(m3_term_labels))),
+    pct_effect = 100 * (exp(estimate) - 1),
+    pct_low = 100 * (exp(conf.low) - 1),
+    pct_high = 100 * (exp(conf.high) - 1)
+  )
+
+ggplot(m3_key_effects, aes(x = pct_effect, y = term_label)) +
+  geom_vline(xintercept = 0, color = "grey70", linetype = 2) +
+  geom_pointrange(aes(xmin = pct_low, xmax = pct_high), color = "#7c2d12", linewidth = 0.7) +
+  labs(
+    title = "M3 key fixed effects on delivery time (approx. % scale)",
+    x = "Approx. % change in expected lead time",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+R² evolution (marginal vs conditional):
+
+- M0: `r sprintf("%.3f", model_compare_tbl$r2_marginal[model_compare_tbl$model == "M0"])` / `r sprintf("%.3f", model_compare_tbl$r2_conditional[model_compare_tbl$model == "M0"])`.
+- M1: `r sprintf("%.3f", model_compare_tbl$r2_marginal[model_compare_tbl$model == "M1"])` / `r sprintf("%.3f", model_compare_tbl$r2_conditional[model_compare_tbl$model == "M1"])`.
+- M2: `r sprintf("%.3f", model_compare_tbl$r2_marginal[model_compare_tbl$model == "M2"])` / `r sprintf("%.3f", model_compare_tbl$r2_conditional[model_compare_tbl$model == "M2"])`.
+- M3: `r sprintf("%.3f", model_compare_tbl$r2_marginal[model_compare_tbl$model == "M3"])` / `r sprintf("%.3f", model_compare_tbl$r2_conditional[model_compare_tbl$model == "M3"])`.
+
+In plain terms, hierarchy explains a large base share, routing gives the first major fixed-effects jump, shipment terms add incremental refinement, and time/theme controls add the final substantial gain in the pooled baseline.
+
+
+```{r}
+# Simple residual diagnostics for M3
+par(mfrow = c(1, 2))
+plot(fitted(mod_M3), resid(mod_M3),
+     pch = 16, cex = 0.3,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "M3: Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+
+qqnorm(resid(mod_M3), main = "M3: Residual QQ-plot")
+qqline(resid(mod_M3), col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+```
+
+From the residual vs fitted and residual QQ‑plot for M3:
+
+Residual vs fitted: cloud is roughly symmetric around zero, with no strong funnel shape or obvious non‑linear pattern → variance is reasonably stable across the fitted range.
+
+
+Residual QQ‑plot: middle of the distribution lies close to the 45° line, but the upper tail bends upwards (a few residuals much larger than Gaussian) and lower tail slightly downwards.
+
+→ The log transformation handled most skewness, but there remain heavy tails and a small number of large residuals.
+
+These diagnostics suggest that the log‑mixed model captures most systematic structure, but residuals remain heavy‑tailed, reinforcing the need for the robust and trimming experiments planned in the next section.
+
+Conclusion:
+Across models M0–M3, hierarchy, routing, shipment features, and time controls explain a substantial share of variability in log‑delivery lead time. The M4 extensions then show that key routing and freight effects are heterogeneous across shipment regimes, with large fit gains relative to the pooled M3 baseline. Residuals remain heavy‑tailed, and multivariate shipment outliers are non-trivial, so the next section stress-tests inference with robust flat estimators, mixed-model variants, regional refits, and bootstrap intervals.
+
+Model-engineering conclusion:
+
+- Cluster-informed heterogeneity is not only descriptive; it materially improves model fit and changes substantive interpretation of effect sizes.
+- `M4_c2_cluster_interactions` is the preferred inferential model in this run because it strongly outperforms both `M3_base` and `M4_c1_precluster_main` on likelihood and information criteria, while improving marginal \(R^2\).
+- Section 6 therefore stress-tests `M4_c2` directly.
+
+# 6. Robustness & Bootstrap Analysis
+
+**Observation:** Section 5 models fit well overall, but tails and influential profiles remain visible.
+
+**Risk:** A small subset of atypical orders or sellers could distort fixed-effect inference and subgroup interpretation.
+
+**Experiment design:** I run a sequence of sensitivity experiments on the same modelling sample: robust flat regressions, trimmed/variant mixed models, region-wise mixed models, and bootstrap uncertainty checks.
+
+**Decision rule:** I treat conclusions as robust when key effect signs remain stable and effect magnitudes/CIs change only modestly across these stress tests.
+
+This robustness section is anchored on the preferred M4\_c2 specification.
+
+```{r s6_setup_objects}
+s6_data <- orders_mod_cluster
+s6_model_ref <- mod_M4_c2
+
+s6_core_terms <- c(
+  "is_same_stateTRUE",
+  "is_same_regionTRUE",
+  "z_log_freight",
+  "z_log_items",
+  "z_log_value"
+)
+
+s6_terms_compare <- c(
+  "is_same_stateTRUE",
+  "is_same_regionTRUE",
+  "z_log_freight",
+  "z_log_items",
+  "is_same_stateTRUE:precluster5",
+  "precluster5:z_log_freight",
+  "seasonJJA"
+)
+
+s6_fixed_terms <- paste(
+  "is_same_state * precluster + is_same_region +",
+  "z_log_wgt + z_log_vol + z_log_value + z_log_freight * precluster + z_log_items * precluster +",
+  "season + purchase_year + theme_name"
+)
+
+s6_fixed_terms_no_theme <- paste(
+  "is_same_state * precluster + is_same_region +",
+  "z_log_wgt + z_log_vol + z_log_value + z_log_freight * precluster + z_log_items * precluster +",
+  "season + purchase_year"
+)
+
+tibble::tibble(
+  n_orders = nrow(s6_data),
+  n_sellers = dplyr::n_distinct(s6_data$seller_id),
+  n_customer_states = dplyr::n_distinct(s6_data$customer_state),
+  n_preclusters = dplyr::n_distinct(s6_data$precluster)
+)
+```
+
+**Observation:** Delivery lead times are right-skewed with a long upper tail, residuals remain mildly heavy-tailed after log transformation, and some shipment/seller profiles are clearly atypical.
+
+**Risk:** Classical estimates can be over-influenced by these tails/outliers.
+
+```{r s6_tail_profile}
+lead_quantiles <- stats::quantile(
+  s6_data$lead_time_days_raw,
+  probs = c(0.50, 0.90, 0.95, 0.99),
+  na.rm = TRUE
+)
+
+std_resid <- as.numeric(scale(residuals(s6_model_ref)))
+tail_share_25 <- mean(abs(std_resid) > 2.5, na.rm = TRUE)
+tail_share_30 <- mean(abs(std_resid) > 3.0, na.rm = TRUE)
+
+outlier_share_mcd <- if ("ship_outlier_mcd" %in% names(s6_data)) {
+  mean(s6_data$ship_outlier_mcd, na.rm = TRUE)
+} else {
+  NA_real_
+}
+
+seller_re <- ranef(s6_model_ref)$seller_id[[1]]
+seller_re_quantiles <- stats::quantile(seller_re, probs = c(0.01, 0.50, 0.99), na.rm = TRUE)
+
+list(
+  lead_time_quantiles_days = lead_quantiles,
+  residual_tail_share_abs_gt_2_5 = tail_share_25,
+  residual_tail_share_abs_gt_3_0 = tail_share_30,
+  shipment_mcd_outlier_share = outlier_share_mcd,
+  seller_random_intercept_quantiles = seller_re_quantiles
+)
+```
+
+**Experiment framing (AMS-consistent):** These diagnostics match the robust-settings from class (heavy tails, vertical outliers, leverage risk), so each subsection below tests whether the main effects survive alternative estimators and perturbations.
+
+## 6.1 Robust regression on flat models
+**Observation:** Flat-model residuals show mild heavy tails and possible influential points.
+
+**Risk:** OLS coefficients may be sensitive to vertical outliers/bad leverage.
+
+**Experiment:** Refit the same flat specification with Huber M-estimation and LTS, then compare key coefficients against OLS.
+
+**Decision rule:** If signs are unchanged and absolute differences are small, I treat flat-model conclusions as robust.
+
+```{r s6_robust_flat_models, cache=TRUE}
+flat_formula <- log_lead_time ~
+  is_same_state + is_same_region +
+  z_log_wgt + z_log_vol + z_log_value + z_log_freight + z_log_items
+
+flat_data <- s6_data %>%
+  dplyr::select(
+    log_lead_time, is_same_state, is_same_region,
+    z_log_wgt, z_log_vol, z_log_value, z_log_freight, z_log_items
+  ) %>%
+  tidyr::drop_na()
+
+fit_flat_ols <- lm(flat_formula, data = flat_data)
+fit_flat_huber <- robustbase::lmrob(flat_formula, data = flat_data, setting = "KS2014")
+fit_flat_lts <- robustbase::ltsReg(flat_formula, data = flat_data, alpha = 0.75, nsamp = 500)
+
+coef_compare_flat <- tibble::tibble(
+  term = s6_core_terms,
+  ols = unname(coef(fit_flat_ols)[s6_core_terms]),
+  huber_m = unname(coef(fit_flat_huber)[s6_core_terms]),
+  lts = unname(coef(fit_flat_lts)[s6_core_terms])
+) %>%
+  mutate(
+    abs_diff_huber_vs_ols = abs(huber_m - ols),
+    abs_diff_lts_vs_ols = abs(lts - ols)
+  )
+
+coef_compare_flat
+```
+
+```{r s6_plot_flat_coef_stability, fig.height=4.8, fig.width=8}
+term_labels <- c(
+  is_same_stateTRUE = "Same-state shipment",
+  is_same_regionTRUE = "Same-region shipment",
+  z_log_freight = "Freight cost (z log)",
+  z_log_items = "Item count (z log)",
+  z_log_value = "Order value (z log)"
+)
+
+coef_flat_plot <- coef_compare_flat %>%
+  tidyr::pivot_longer(
+    cols = c(ols, huber_m, lts),
+    names_to = "model",
+    values_to = "estimate"
+  ) %>%
+  dplyr::mutate(
+    model = factor(
+      model,
+      levels = c("ols", "huber_m", "lts"),
+      labels = c("OLS", "Huber M", "LTS")
+    ),
+    term_label = term_labels[term],
+    term_label = factor(term_label, levels = rev(unname(term_labels)))
+  )
+
+coef_flat_span <- coef_flat_plot %>%
+  dplyr::group_by(term_label) %>%
+  dplyr::summarise(
+    min_est = min(estimate, na.rm = TRUE),
+    max_est = max(estimate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(coef_flat_plot, aes(x = estimate, y = term_label, color = model)) +
+  geom_vline(xintercept = 0, color = "grey70", linetype = 2) +
+  geom_segment(
+    data = coef_flat_span,
+    aes(x = min_est, xend = max_est, y = term_label, yend = term_label),
+    inherit.aes = FALSE,
+    color = "grey80",
+    linewidth = 1.4
+  ) +
+  geom_point(position = position_dodge(width = 0.4), size = 2.5) +
+  labs(
+    title = "Section 6.1: Coefficient stability across OLS and robust estimators",
+    x = "Estimate on log-lead-time scale",
+    y = NULL,
+    color = NULL
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+- Magnitudes: for all five core terms, robust estimates differ from OLS by only a few hundredths of a log-unit.
+- Direction: signs are identical across OLS, Huber M, and LTS for same-state, same-region, freight, items, and value, so outliers do not flip substantive conclusions.
+- Routing strength: same-state coefficients remain large and negative across estimators, confirming a stable same-state speed advantage.
+- Plot reading: OLS, Huber M, and LTS points for each term lie close together and on the same side of zero.
+- Max drift benchmark: the largest absolute robust-vs-OLS difference is `r sprintf("%.3f", max(c(coef_compare_flat$abs_diff_huber_vs_ols, coef_compare_flat$abs_diff_lts_vs_ols), na.rm = TRUE))`.
+
+**Result/decision:** The robust and OLS estimates stay closely aligned, so the 6.1 robustness criterion is supported.
+
+## 6.2 Trimming and variant mixed‑effects fits
+
+**Observation:** The outcome has a long upper tail, and mixed-model conclusions could depend on tail handling or modelling choices.
+
+**Risk:** Main effects may be model-dependent (specific random-effects structure or control set).
+
+**Experiment:** Stress-test M4\_c2 with (i) 95th-percentile trimming, (ii) removing theme controls, and (iii) seller-only random effects; compare fixed effects and variance components.
+
+**Decision rule:** If key terms remain same-sign with modest coefficient drift, multilevel conclusions are considered stable.
+
+```{r s6_trimmed_and_variant_lmm, cache=TRUE}
+cut95 <- stats::quantile(s6_data$lead_time_days_raw, probs = 0.95, na.rm = TRUE)
+
+orders_mod_trim <- s6_data %>%
+  mutate(
+    lead_time_days_trim95 = pmin(lead_time_days_raw, cut95),
+    log_lead_trim95 = log1p(lead_time_days_trim95)
+  )
+
+formula_m4_trim95 <- as.formula(
+  paste0(
+    "log_lead_trim95 ~ ", s6_fixed_terms,
+    " + (1 | seller_id) + (1 | customer_state)"
+  )
+)
+
+formula_m4_no_theme <- as.formula(
+  paste0(
+    "log_lead_time ~ ", s6_fixed_terms_no_theme,
+    " + (1 | seller_id) + (1 | customer_state)"
+  )
+)
+
+formula_m4_seller_only <- as.formula(
+  paste0(
+    "log_lead_time ~ ", s6_fixed_terms,
+    " + (1 | seller_id)"
+  )
+)
+
+mod_M4_c2_ML <- update(mod_M4_c2, REML = FALSE)
+mod_M4_trim95 <- lmer(formula_m4_trim95, data = orders_mod_trim, REML = FALSE)
+mod_M4_no_theme <- lmer(formula_m4_no_theme, data = s6_data, REML = FALSE)
+mod_M4_seller_only <- lmer(formula_m4_seller_only, data = s6_data, REML = FALSE)
+
+safe_extract_fixef <- function(model, terms) {
+  cf <- fixef(model)
+  out <- rep(NA_real_, length(terms))
+  names(out) <- terms
+  out[intersect(terms, names(cf))] <- cf[intersect(terms, names(cf))]
+  unname(out)
+}
+
+coef_compare_m4_variants <- tibble::tibble(
+  term = s6_terms_compare,
+  m4_main = safe_extract_fixef(mod_M4_c2_ML, s6_terms_compare),
+  m4_trim95 = safe_extract_fixef(mod_M4_trim95, s6_terms_compare),
+  m4_no_theme = safe_extract_fixef(mod_M4_no_theme, s6_terms_compare),
+  m4_seller_only = safe_extract_fixef(mod_M4_seller_only, s6_terms_compare)
+) %>%
+  mutate(
+    abs_diff_trim95 = abs(m4_trim95 - m4_main),
+    abs_diff_no_theme = abs(m4_no_theme - m4_main),
+    abs_diff_seller_only = abs(m4_seller_only - m4_main)
+  )
+
+get_re_var <- function(model, grp_name) {
+  vc <- as.data.frame(VarCorr(model))
+  hit <- vc$grp == grp_name & vc$var1 == "(Intercept)"
+  if (any(hit)) vc$vcov[which(hit)[1]] else NA_real_
+}
+
+var_compare <- tibble::tibble(
+  model = c("M4_c2_main", "M4_trim95", "M4_no_theme", "M4_seller_only"),
+  seller_intercept_var = c(
+    get_re_var(mod_M4_c2_ML, "seller_id"),
+    get_re_var(mod_M4_trim95, "seller_id"),
+    get_re_var(mod_M4_no_theme, "seller_id"),
+    get_re_var(mod_M4_seller_only, "seller_id")
+  ),
+  customer_state_intercept_var = c(
+    get_re_var(mod_M4_c2_ML, "customer_state"),
+    get_re_var(mod_M4_trim95, "customer_state"),
+    get_re_var(mod_M4_no_theme, "customer_state"),
+    get_re_var(mod_M4_seller_only, "customer_state")
+  ),
+  residual_var = c(
+    sigma(mod_M4_c2_ML)^2,
+    sigma(mod_M4_trim95)^2,
+    sigma(mod_M4_no_theme)^2,
+    sigma(mod_M4_seller_only)^2
+  )
+)
+
+list(
+  coefficient_stability = coef_compare_m4_variants,
+  random_effect_variance_stability = var_compare
+)
+```
+
+```{r s6_plot_lmm_sensitivity, fig.height=5.2, fig.width=9}
+delta_plot <- coef_compare_m4_variants %>%
+  dplyr::select(term, abs_diff_trim95, abs_diff_no_theme, abs_diff_seller_only) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("abs_diff_"),
+    names_to = "variant",
+    values_to = "abs_delta"
+  ) %>%
+  dplyr::mutate(
+    variant = factor(
+      variant,
+      levels = c("abs_diff_trim95", "abs_diff_no_theme", "abs_diff_seller_only"),
+      labels = c("Trim at 95th percentile", "Remove theme controls", "Seller random effect only")
+    ),
+    term_label = dplyr::recode(
+      term,
+      is_same_stateTRUE = "Same-state shipment",
+      is_same_regionTRUE = "Same-region shipment",
+      z_log_freight = "Freight cost",
+      z_log_items = "Item count",
+      `is_same_stateTRUE:precluster5` = "Same-state × cluster 5",
+      `precluster5:z_log_freight` = "Freight × cluster 5",
+      seasonJJA = "Season: JJA"
+    ),
+    term_label = factor(term_label, levels = rev(c(
+      "Same-state shipment",
+      "Same-region shipment",
+      "Freight cost",
+      "Item count",
+      "Same-state × cluster 5",
+      "Freight × cluster 5",
+      "Season: JJA"
+    )))
+  )
+
+ggplot(delta_plot, aes(x = variant, y = term_label, fill = abs_delta)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_gradient(low = "#f1f5f9", high = "#0f766e") +
+  labs(
+    title = "Section 6.2: Sensitivity heatmap (absolute coefficient change vs M4_c2)",
+    x = NULL,
+    y = NULL,
+    fill = "|Delta|"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+- Trim and specification stress tests: moving from main M4\_c2 to trimmed and structure-variant models shifts key coefficients only modestly, and core signs stay unchanged.
+- Same-state effect: the coefficient remains clearly negative across all tested variants, so the routing conclusion is stable.
+- Freight and items: freight remains positive and items remains negative, with relatively small drift versus the main model.
+- Variance components: residual variance declines under trimming and random-effect variances shrink slightly in variants, but seller and customer-state heterogeneity remain non-zero.
+- Plot reading (heatmap): mostly light tiles indicate small absolute coefficient deltas versus M4\_c2, with larger movement concentrated in a minority of term-variant cells.
+- Max drift benchmark: the largest absolute coefficient delta across mixed-model variants is `r sprintf("%.3f", max(c(coef_compare_m4_variants$abs_diff_trim95, coef_compare_m4_variants$abs_diff_no_theme, coef_compare_m4_variants$abs_diff_seller_only), na.rm = TRUE))`.
+
+**Result/decision:** Coefficient drift across variants is limited and core signs persist, so the 6.2 stability criterion is supported.
+
+## 6.3 Region‑specific models
+
+**Observation:** Brazil is geographically heterogeneous, so pooled effects may hide regional differences.
+
+**Risk:** Main conclusions could be driven by one or two dominant regions rather than being transportable.
+
+**Experiment:** Refit simplified mixed models by customer macro-region and compare effect direction/magnitude against national estimates.
+
+**Decision rule:** If key effects keep the same sign across regions with moderate magnitude shifts, transportability is supported.
+
+```{r s6_region_specific_lmm, cache=TRUE}
+regions <- c("North", "Northeast", "Central-West", "Southeast", "South")
+region_terms <- c("is_same_stateTRUE", "z_log_freight", "z_log_items", "z_log_value")
+
+region_fit <- lapply(regions, function(reg) {
+  dat_reg <- s6_data %>% filter(customer_region == reg)
+
+  meta <- tibble::tibble(
+    customer_region = reg,
+    n_orders = nrow(dat_reg),
+    n_sellers = dplyr::n_distinct(dat_reg$seller_id),
+    n_same_state = sum(dat_reg$is_same_state %in% TRUE, na.rm = TRUE),
+    n_diff_state = sum(dat_reg$is_same_state %in% FALSE, na.rm = TRUE),
+    estimable_same_state = dplyr::n_distinct(dat_reg$is_same_state) >= 2L
+  )
+
+  if (nrow(dat_reg) < 100L || dplyr::n_distinct(dat_reg$is_same_state) < 2L) {
+    return(list(meta = meta %>% mutate(note = "Skipped: insufficient variation"), coef = tibble::tibble()))
+  }
+
+  fit_reg <- tryCatch(
+    lmer(
+      log_lead_time ~ is_same_state + z_log_value + z_log_freight + z_log_items + (1 | seller_id),
+      data = dat_reg,
+      REML = FALSE
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit_reg)) {
+    return(list(meta = meta %>% mutate(note = "Fit failed"), coef = tibble::tibble()))
+  }
+
+  coef_tbl <- broom.mixed::tidy(
+    fit_reg,
+    effects = "fixed",
+    conf.int = TRUE,
+    conf.method = "Wald"
+  ) %>%
+    filter(term %in% region_terms) %>%
+    mutate(customer_region = reg)
+
+  list(meta = meta %>% mutate(note = NA_character_), coef = coef_tbl)
+})
+
+region_meta <- dplyr::bind_rows(lapply(region_fit, `[[`, "meta"))
+region_coef <- dplyr::bind_rows(lapply(region_fit, `[[`, "coef")) %>%
+  dplyr::select(customer_region, term, estimate, std.error, conf.low, conf.high)
+
+region_sign_check <- region_coef %>%
+  dplyr::group_by(term) %>%
+  dplyr::summarise(
+    min_estimate = min(estimate, na.rm = TRUE),
+    max_estimate = max(estimate, na.rm = TRUE),
+    same_sign_across_regions = (min_estimate > 0 & max_estimate > 0) | (min_estimate < 0 & max_estimate < 0),
+    .groups = "drop"
+  )
+
+list(
+  region_sample_sizes = region_meta,
+  region_coefficients = region_coef,
+  sign_stability = region_sign_check
+)
+```
+
+```{r s6_plot_region_forest, fig.height=5.8, fig.width=9}
+region_labels <- c(
+  is_same_stateTRUE = "Same-state shipment",
+  z_log_freight = "Freight cost",
+  z_log_items = "Item count",
+  z_log_value = "Order value"
+)
+
+region_plot_df <- region_coef %>%
+  dplyr::mutate(
+    customer_region = factor(customer_region, levels = regions),
+    term_label = region_labels[term]
+  )
+
+national_ref <- tibble::tibble(
+  term = names(region_labels),
+  term_label = unname(region_labels),
+  national_estimate = unname(fixef(s6_model_ref)[names(region_labels)])
+)
+
+ggplot(region_plot_df, aes(x = customer_region, y = estimate)) +
+  geom_hline(yintercept = 0, color = "grey70", linetype = 2) +
+  geom_hline(
+    data = national_ref,
+    aes(yintercept = national_estimate),
+    color = "grey35",
+    linetype = 3
+  ) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high), color = "#0f766e") +
+  facet_wrap(~ term_label, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Section 6.3: Region-specific effects with national reference lines",
+    x = "Customer macro-region",
+    y = "Estimate on log-lead-time scale"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+- Across macro-regions, same-state estimates remain negative and freight estimates positive, so the direction of routing and shipment-cost effects is stable nationwide.
+- Regions with longer average shipping distances (for example North and Northeast) tend to show larger same-state effects, which is coherent with geography rather than contradictory.
+
+**Result/decision:** Regional fits preserve the main effect directions, so the 6.3 transportability criterion is supported.
+
+## 6.4 Bootstrap uncertainty for the final mixed model
+**Observation:** Mixed-model inference relies on asymptotic approximations that may be imperfect under mild non-normality.
+
+**Risk:** Standard Wald intervals could understate uncertainty.
+
+**Experiment:** Run parametric bootstrap for the final mixed model, report percentile CIs for key fixed effects as the primary inference, and compare with normal-approximation (Wald) CIs.
+
+**Decision rule:** If percentile and Wald intervals largely overlap and imply the same substantive interpretation, inference is considered stable.
+
+```{r s6_bootstrap_fixed_effects, cache=TRUE}
+boot_terms <- c(
+  "is_same_stateTRUE",
+  "is_same_regionTRUE",
+  "z_log_freight",
+  "is_same_stateTRUE:precluster5",
+  "precluster5:z_log_freight"
+)
+boot_fun <- function(fit) unname(fixef(fit)[boot_terms])
+
+set.seed(42)
+boot_nsim <- 80L
+boot_m4 <- lme4::bootMer(
+  mod_M4_c2,
+  FUN = boot_fun,
+  nsim = boot_nsim,
+  type = "parametric",
+  use.u = FALSE,
+  parallel = "no"
+)
+
+boot_rep <- as.data.frame(boot_m4$t)
+colnames(boot_rep) <- boot_terms
+
+boot_ci_tbl <- purrr::map_dfr(boot_terms, function(term_name) {
+  vals <- boot_rep[[term_name]]
+  tibble::tibble(
+    term = term_name,
+    point_estimate = fixef(mod_M4_c2)[term_name],
+    boot_mean = mean(vals, na.rm = TRUE),
+    boot_sd = sd(vals, na.rm = TRUE),
+    boot_perc_low = as.numeric(stats::quantile(vals, 0.025, na.rm = TRUE)),
+    boot_perc_high = as.numeric(stats::quantile(vals, 0.975, na.rm = TRUE))
+  )
+})
+
+wald_ci <- as.data.frame(confint(mod_M4_c2, parm = boot_terms, method = "Wald")) %>%
+  tibble::rownames_to_column("term") %>%
+  rename(wald_low = `2.5 %`, wald_high = `97.5 %`)
+
+boot_vs_wald <- boot_ci_tbl %>%
+  left_join(wald_ci, by = "term") %>%
+  mutate(
+    interval_overlap = pmax(boot_perc_low, wald_low) <= pmin(boot_perc_high, wald_high),
+    low_diff_boot_minus_wald = boot_perc_low - wald_low,
+    high_diff_boot_minus_wald = boot_perc_high - wald_high
+  )
+
+boot_vs_wald
+```
+
+```{r s6_plot_bootstrap_wald, fig.height=4.8, fig.width=8.8}
+ci_labels <- c(
+  is_same_stateTRUE = "Same-state shipment",
+  is_same_regionTRUE = "Same-region shipment",
+  z_log_freight = "Freight cost",
+  `is_same_stateTRUE:precluster5` = "Same-state × cluster 5",
+  `precluster5:z_log_freight` = "Freight × cluster 5"
+)
+
+ci_plot_df <- dplyr::bind_rows(
+  boot_vs_wald %>%
+    dplyr::transmute(
+      term,
+      method = "Bootstrap percentile",
+      estimate = point_estimate,
+      low = boot_perc_low,
+      high = boot_perc_high
+    ),
+  boot_vs_wald %>%
+    dplyr::transmute(
+      term,
+      method = "Wald",
+      estimate = point_estimate,
+      low = wald_low,
+      high = wald_high
+    )
+) %>%
+  dplyr::mutate(
+    term_label = ci_labels[term],
+    term_label = factor(term_label, levels = rev(unname(ci_labels))),
+    method = factor(method, levels = c("Bootstrap percentile", "Wald"))
+  )
+
+ggplot(ci_plot_df, aes(y = term_label, x = estimate, color = method)) +
+  geom_vline(xintercept = 0, color = "grey70", linetype = 2) +
+  geom_pointrange(
+    aes(xmin = low, xmax = high),
+    position = position_dodge(width = 0.55),
+    linewidth = 0.6
+  ) +
+  labs(
+    title = "Section 6.4: Bootstrap vs Wald confidence intervals",
+    x = "Estimate and 95% interval",
+    y = NULL,
+    color = NULL
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+- Interval width: bootstrap percentile and Wald 95% intervals are nearly identical for all key terms, with only very small endpoint differences.
+- Overlap: intervals fully overlap for each key term and lead to the same significance conclusions.
+- Centering: bootstrap intervals are centered close to the model point estimates, suggesting no material bootstrap-detected bias.
+- Plot reading: bootstrap and Wald bars nearly overlap term-by-term in the CI plot, confirming a consistent uncertainty story.
+- Overlap score: `r sprintf("%.0f", 100 * mean(boot_vs_wald$interval_overlap, na.rm = TRUE))`% of term-level intervals overlap.
+
+**Result/decision:** Bootstrap and Wald intervals are highly consistent, so the 6.4 uncertainty criterion is supported.
+
+## 6.5 Robustness verdict summary
+
+```{r s6_robustness_verdict_table}
+safe_max <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  max(x, na.rm = TRUE)
+}
+
+flat_max_delta <- safe_max(c(
+  coef_compare_flat$abs_diff_huber_vs_ols,
+  coef_compare_flat$abs_diff_lts_vs_ols
+))
+
+lmm_max_delta <- safe_max(c(
+  coef_compare_m4_variants$abs_diff_trim95,
+  coef_compare_m4_variants$abs_diff_no_theme,
+  coef_compare_m4_variants$abs_diff_seller_only
+))
+
+region_sign_share <- mean(region_sign_check$same_sign_across_regions, na.rm = TRUE)
+ci_overlap_share <- mean(boot_vs_wald$interval_overlap, na.rm = TRUE)
+
+robustness_verdict <- tibble::tibble(
+  check = c(
+    "Flat robust estimators",
+    "Mixed-model variants",
+    "Region-specific consistency",
+    "Bootstrap vs Wald intervals"
+  ),
+  metric = c(
+    "Max |Delta| vs OLS",
+    "Max |Delta| vs baseline M4_c2",
+    "Share of terms with same sign across regions",
+    "Share of terms with CI overlap"
+  ),
+  value = c(flat_max_delta, lmm_max_delta, region_sign_share, ci_overlap_share),
+  threshold = c("< 0.02", "< 0.03", ">= 0.75", ">= 0.80")
+) %>%
+  dplyr::mutate(
+    verdict = dplyr::case_when(
+      check == "Flat robust estimators" & value < 0.02 ~ "PASS",
+      check == "Mixed-model variants" & value < 0.03 ~ "PASS",
+      check == "Region-specific consistency" & value >= 0.75 ~ "PASS",
+      check == "Bootstrap vs Wald intervals" & value >= 0.80 ~ "PASS",
+      TRUE ~ "REVIEW"
+    ),
+    value = round(value, 3)
+  )
+
+robustness_verdict
+```
+
+```{r s7_summary_metrics}
+get_intercept_var <- function(model, grp_name) {
+  vc <- as.data.frame(VarCorr(model))
+  hit <- vc$grp == grp_name & vc$var1 == "(Intercept)"
+  if (any(hit)) vc$vcov[which(hit)[1]] else NA_real_
+}
+
+n_orders_final <- nrow(orders_mod_cluster)
+
+m3_seller_var <- get_intercept_var(mod_M3, "seller_id")
+m3_state_var <- get_intercept_var(mod_M3, "customer_state")
+m3_resid_var <- sigma(mod_M3)^2
+m3_total_var <- m3_seller_var + m3_state_var + m3_resid_var
+m3_higher_level_share <- 100 * (m3_seller_var + m3_state_var) / m3_total_var
+
+m3_aic <- cluster_model_tbl$AIC[cluster_model_tbl$model == "M3_base"]
+m3_bic <- cluster_model_tbl$BIC[cluster_model_tbl$model == "M3_base"]
+m4_aic <- cluster_model_tbl$AIC[cluster_model_tbl$model == "M4_c2_cluster_interactions"]
+m4_bic <- cluster_model_tbl$BIC[cluster_model_tbl$model == "M4_c2_cluster_interactions"]
+m3_r2_marg <- cluster_model_tbl$r2_marginal[cluster_model_tbl$model == "M3_base"]
+m4_r2_marg <- cluster_model_tbl$r2_marginal[cluster_model_tbl$model == "M4_c2_cluster_interactions"]
+
+same_state_range <- range(
+  cluster_stratified_tbl$estimate[cluster_stratified_tbl$term == "is_same_stateTRUE"],
+  na.rm = TRUE
+)
+freight_range <- range(
+  cluster_stratified_tbl$estimate[cluster_stratified_tbl$term == "z_log_freight"],
+  na.rm = TRUE
+)
+```
+
+# 7. Key Findings and Discussion
+
+## 7.1 Research questions and main patterns
+This study addressed three linked questions: variance decomposition under hierarchy (RQ1), fixed-effect drivers of delivery time (RQ2), and robustness under outliers and re-specification (RQ3). On `r scales::comma(n_orders_final)` orders, the M0→M3 ladder established the pooled multilevel baseline, and M4 showed that part of the fixed-effect story is cluster-conditioned rather than constant. The core message is consistent: routing dominates, shipment features refine, and seller/state clustering remains material.
+
+## 7.2 Seller and destination heterogeneity
+Even after adjustment for route, shipment profile, season, and theme, meaningful between-group heterogeneity remains. In M3, seller random-intercept variance is `r sprintf("%.3f", m3_seller_var)`, customer-state variance is `r sprintf("%.3f", m3_state_var)`, and residual variance is `r sprintf("%.3f", m3_resid_var)` on the log scale. This means about `r sprintf("%.1f", m3_higher_level_share)`% of total variance still sits at higher levels, which keeps the multilevel specification empirically justified.
+
+## 7.3 Routing and shipment effects with magnitudes
+Routing remains the dominant operational lever, but M4 confirms that effects are not homogeneous across shipment regimes. Relative to M3, adding precluster main effects (M4\_c1) improves fit (\(\chi^2 = `r sprintf("%.2f", lrt_base_vs_M4_c1$Chisq[2])`\), \(df = `r lrt_base_vs_M4_c1$Df[2]`\), p `r {pv <- format.pval(lrt_base_vs_M4_c1[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16); if (startsWith(pv, "<")) pv else paste0("= ", pv)}`). Adding interactions (M4\_c2) gives a much larger gain (\(\chi^2 = `r sprintf("%.1f", lrt_M4_c1_vs_M4_c2$Chisq[2])`\), \(df = `r lrt_M4_c1_vs_M4_c2$Df[2]`\), p `r {pv <- format.pval(lrt_M4_c1_vs_M4_c2[["Pr(>Chisq)"]][2], digits = 3, eps = 1e-16); if (startsWith(pv, "<")) pv else paste0("= ", pv)}`), with AIC/BIC moving from `r sprintf("%.0f", m3_aic)`/`r sprintf("%.0f", m3_bic)` to `r sprintf("%.0f", m4_aic)`/`r sprintf("%.0f", m4_bic)`. Marginal \(R^2\) rises from `r sprintf("%.3f", m3_r2_marg)` to `r sprintf("%.3f", m4_r2_marg)`.
+
+The direction of key effects stays stable, but magnitudes vary by regime: same-state coefficients range from `r sprintf("%.3f", same_state_range[1])` to `r sprintf("%.3f", same_state_range[2])`, while freight coefficients range from `r sprintf("%.3f", freight_range[1])` to `r sprintf("%.3f", freight_range[2])`. A pooled coefficient is still useful as an average, but it masks meaningful operational heterogeneity.
+
+## 7.4 Robustness and credibility of the results
+A full robustness battery suggests the conclusions are not driven by a few extreme orders or by one modelling choice. MCD diagnostics flag about `r sprintf("%.2f", 100 * outlier_share_mcd)`% of shipment-profile outliers, but robust flat fits preserve OLS directions with max drift `r sprintf("%.3f", flat_max_delta)`. Mixed-model stress tests (trim95, no-theme, seller-only) keep core signs with max drift `r sprintf("%.3f", lmm_max_delta)`. Region-specific models preserve effect direction for `r sprintf("%.0f", 100 * region_sign_share)`% of tracked terms, and bootstrap-vs-Wald intervals overlap for `r sprintf("%.0f", 100 * ci_overlap_share)`% of terms.
+
+Overall, the robustness evidence is strong for effect direction and acceptable for effect magnitude. The practical interpretation is cautious but clear: ordering of effects is stable, while exact coefficient size remains moderately specification-sensitive.
+
+## 7.5 Managerial implications and limitations
+From an applied perspective, the results point to three priorities. First, local/regional routing remains the largest controllable lever, so inventory positioning and seller-matching rules should maximize same-state fulfillment when feasible. Second, ETA models should be regime-aware: M4 results indicate that freight and routing effects vary materially across shipment profiles, so one global SLA rule is suboptimal. Third, seller/state random-effect dispersion remains substantial after adjustment, so platform operations should keep explicit seller-performance monitoring and targeted support for slow-tail sellers.
+
+Limitations remain clear. The study is observational and single-platform, so coefficients are associational. Key operational variables (carrier contracts, warehouse network, route congestion, fulfillment cut-off discipline) are unobserved and likely absorb into seller/state effects. Preclusters are also model-based constructs from observed shipment features, useful for heterogeneity engineering but not latent causal classes. Future work should test random-slope multilevel variants, richer robust likelihoods, and external validation on a different period or marketplace.
